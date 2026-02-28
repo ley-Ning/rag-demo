@@ -1,0 +1,52 @@
+/* Apple-inspired Design Tokens */
+:root {
+  /* Colors - Apple Gray Scale */
+  --rag-bg-base: #f5f5f7;
+  --rag-bg-deep: #1d1d1f;
+  --rag-bg-panel: rgba(255, 255, 255, 0.72);
+  --rag-bg-panel-strong: #ffffff;
+  --rag-bg-contrast: #000000;
+  --rag-bg-chip: rgba(0, 113, 227, 0.08);
+
+  /* Text Colors */
+  --rag-text-main: #1d1d1f;
+  --rag-text-soft: #424245;
+  --rag-text-muted: #86868b;
+  --rag-text-invert: #f5f5f7;
+
+  /* Borders */
+  --rag-border: rgba(0, 0, 0, 0.08);
+  --rag-border-strong: rgba(0, 0, 0, 0.12);
+
+  /* Accent Colors */
+  --rag-accent: #0071e3;
+  --rag-accent-hover: #0077ed;
+  --rag-accent-2: #bf5af2;
+  --rag-success: #30d158;
+  --rag-warning: #ff9f0a;
+  --rag-error: #ff453a;
+
+  /* Shadows - Apple Style */
+  --rag-shadow: 0 4px 28px rgba(0, 0, 0, 0.12), 0 1px 2px rgba(0, 0, 0, 0.08);
+  --rag-shadow-soft: 0 2px 12px rgba(0, 0, 0, 0.08);
+  --rag-shadow-elevated: 0 8px 40px rgba(0, 0, 0, 0.16), 0 2px 4px rgba(0, 0, 0, 0.08);
+  --rag-shadow-card: 0 1px 3px rgba(0, 0, 0, 0.06), 0 4px 16px rgba(0, 0, 0, 0.08);
+
+  /* Radius */
+  --rag-radius-sm: 8px;
+  --rag-radius-md: 12px;
+  --rag-radius-lg: 16px;
+  --rag-radius-xl: 20px;
+  --rag-radius-2xl: 24px;
+  --rag-radius-full: 9999px;
+
+  /* Transitions */
+  --rag-ease: cubic-bezier(0.25, 0.1, 0.25, 1);
+  --rag-ease-out: cubic-bezier(0, 0, 0.2, 1);
+  --rag-ease-in-out: cubic-bezier(0.4, 0, 0.2, 1);
+  --rag-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+
+  /* Blur */
+  --rag-blur: 20px;
+  --rag-blur-strong: 40px;
+}

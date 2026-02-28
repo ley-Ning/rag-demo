@@ -1,0 +1,16 @@
+.DS_Store
+
+# frontend build artifacts
+frontend/node_modules/
+frontend/.next/
+frontend/.env.local
+
+# python artifacts
+python-service/.venv/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# logs
+*.log
