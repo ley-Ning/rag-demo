@@ -2,6 +2,7 @@
 
 import {
   AppstoreOutlined,
+  BarChartOutlined,
   CompassOutlined,
   FileSearchOutlined,
   MenuFoldOutlined,
@@ -33,6 +34,11 @@ const menuItems: MenuProps["items"] = [
     label: "模型管理",
   },
   {
+    key: "/observability",
+    icon: <BarChartOutlined />,
+    label: "消耗日志",
+  },
+  {
     key: "/settings",
     icon: <SettingOutlined />,
     label: "系统设置",
@@ -51,6 +57,10 @@ const pathTitleMap: Record<string, { title: string; subtitle: string }> = {
   "/models": {
     title: "模型管理",
     subtitle: "模型池配置与状态监控",
+  },
+  "/observability": {
+    title: "消耗日志",
+    subtitle: "Prompt Token 与 MCP Skill 调用明细",
   },
   "/settings": {
     title: "系统设置",

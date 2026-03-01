@@ -214,6 +214,14 @@ class ModelRegistry:
                 return False
             return current.status == "online" and capability in current.capabilities
 
+    def get_model(self, model_id: str) -> ModelInfo:
+        """获取单个模型配置"""
+        with self._lock:
+            current = self._models.get(model_id)
+            if current is None:
+                raise KeyError(f"模型不存在: {model_id}")
+            return current
+
 
 _registry = ModelRegistry(get_settings().model_registry_path)
 
@@ -240,3 +248,8 @@ def delete_model(model_id: str) -> dict[str, object]:
 
 def model_supports(model_id: str, capability: str) -> bool:
     return _registry.model_supports(model_id, capability)
+
+
+def get_model(model_id: str) -> ModelInfo:
+    """获取单个模型配置"""
+    return _registry.get_model(model_id)

@@ -1,242 +1,331 @@
 "use client";
 
+import { useEffect, useState } from "react";
 import {
   Alert,
   Button,
   Card,
+  Descriptions,
+  Divider,
   Form,
   Input,
-  InputNumber,
-  Select,
-  Space,
   Switch,
+  Table,
+  Tag,
   Typography,
   message,
-  Divider,
 } from "antd";
-import { useState } from "react";
+import type { ColumnsType } from "antd/es/table";
 
-type RuntimeValues = {
-  envName: string;
-  traceSampling: number;
-  enableDebugLog: boolean;
-  maxConcurrentTasks: number;
-};
+import {
+  createMcpServer,
+  fetchMcpServers,
+  fetchMcpTools,
+  syncMcpServerTools,
+  updateMcpServer,
+  updateMcpToolStatus,
+} from "@/lib/rag-api";
+import { McpServerItem, McpToolItem } from "@/types/rag";
 
-type SafetyValues = {
-  uploadWhitelist: string;
-  blockPromptInjection: boolean;
-  answerStyle: "balanced" | "strict" | "concise";
-  citationRequired: boolean;
-};
-
-const runtimeDefaults: RuntimeValues = {
-  envName: "development",
-  traceSampling: 100,
-  enableDebugLog: true,
-  maxConcurrentTasks: 8,
-};
-
-const safetyDefaults: SafetyValues = {
-  uploadWhitelist: "pdf,doc,docx,txt,md",
-  blockPromptInjection: true,
-  answerStyle: "balanced",
-  citationRequired: true,
-};
+const { Title, Paragraph, Text } = Typography;
 
 export default function SettingsPage() {
-  const [runtimeForm] = Form.useForm<RuntimeValues>();
-  const [safetyForm] = Form.useForm<SafetyValues>();
-  const [saving, setSaving] = useState(false);
+  const [servers, setServers] = useState<McpServerItem[]>([]);
+  const [tools, setTools] = useState<McpToolItem[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [creating, setCreating] = useState(false);
+  const [syncingServerKey, setSyncingServerKey] = useState<string | null>(null);
   const [apiMessage, contextHolder] = message.useMessage();
+  const [form] = Form.useForm();
 
-  const saveSettings = async () => {
-    setSaving(true);
+  const loadAll = async () => {
+    setLoading(true);
     try {
-      const runtimeValues = await runtimeForm.validateFields();
-      const safetyValues = await safetyForm.validateFields();
-      console.info("Runtime settings:", runtimeValues);
-      console.info("Safety settings:", safetyValues);
-      apiMessage.success("设置已保存");
-    } catch {
-      apiMessage.warning("请检查配置项是否正确");
+      const [serverItems, toolItems] = await Promise.all([fetchMcpServers(), fetchMcpTools()]);
+      setServers(serverItems);
+      setTools(toolItems);
+    } catch (error) {
+      apiMessage.error((error as Error).message || "加载 MCP 配置失败");
     } finally {
-      setSaving(false);
+      setLoading(false);
     }
   };
 
+  useEffect(() => {
+    void loadAll();
+  }, []);
+
+  const handleCreateServer = async (values: {
+    serverKey: string;
+    name: string;
+    endpoint: string;
+    timeoutMs?: number;
+  }) => {
+    setCreating(true);
+    try {
+      await createMcpServer({
+        serverKey: values.serverKey.trim(),
+        name: values.name.trim(),
+        endpoint: values.endpoint.trim(),
+        timeoutMs: values.timeoutMs || 12000,
+      });
+      apiMessage.success("MCP Server 已创建");
+      form.resetFields();
+      await loadAll();
+    } catch (error) {
+      apiMessage.error((error as Error).message || "创建失败");
+    } finally {
+      setCreating(false);
+    }
+  };
+
+  const toggleServer = async (record: McpServerItem, enabled: boolean) => {
+    try {
+      await updateMcpServer(record.serverKey, { enabled });
+      setServers((prev) =>
+        prev.map((item) => (item.serverKey === record.serverKey ? { ...item, enabled } : item)),
+      );
+      apiMessage.success(`Server 已${enabled ? "启用" : "停用"}`);
+    } catch (error) {
+      apiMessage.error((error as Error).message || "更新失败");
+    }
+  };
+
+  const toggleTool = async (record: McpToolItem, enabled: boolean) => {
+    try {
+      await updateMcpToolStatus(record.toolName, enabled);
+      setTools((prev) =>
+        prev.map((item) => (item.toolName === record.toolName ? { ...item, enabled } : item)),
+      );
+      apiMessage.success(`Tool 已${enabled ? "启用" : "停用"}`);
+    } catch (error) {
+      apiMessage.error((error as Error).message || "更新失败");
+    }
+  };
+
+  const handleSyncTools = async (record: McpServerItem) => {
+    setSyncingServerKey(record.serverKey);
+    try {
+      const result = await syncMcpServerTools(record.serverKey);
+      await loadAll();
+      apiMessage.success(`同步完成：${result.syncedCount} 个工具`);
+    } catch (error) {
+      apiMessage.error((error as Error).message || "同步失败");
+    } finally {
+      setSyncingServerKey(null);
+    }
+  };
+
+  const serverColumns: ColumnsType<McpServerItem> = [
+    {
+      title: "Server Key",
+      dataIndex: "serverKey",
+      key: "serverKey",
+      width: 180,
+      render: (value: string) => <Text code>{value}</Text>,
+    },
+    {
+      title: "名称",
+      dataIndex: "name",
+      key: "name",
+      width: 160,
+    },
+    {
+      title: "Endpoint",
+      dataIndex: "endpoint",
+      key: "endpoint",
+      render: (value: string) => (
+        <Typography.Text ellipsis={{ tooltip: value }} style={{ maxWidth: 320 }}>
+          {value}
+        </Typography.Text>
+      ),
+    },
+    {
+      title: "超时",
+      dataIndex: "timeoutMs",
+      key: "timeoutMs",
+      width: 100,
+      render: (value: number) => `${value}ms`,
+    },
+    {
+      title: "状态",
+      dataIndex: "enabled",
+      key: "enabled",
+      width: 110,
+      render: (_: boolean, record) => (
+        <Switch
+          checked={record.enabled}
+          onChange={(checked) => {
+            void toggleServer(record, checked);
+          }}
+        />
+      ),
+    },
+    {
+      title: "操作",
+      key: "actions",
+      width: 140,
+      render: (_: unknown, record) => (
+        <Button
+          size="small"
+          disabled={!record.enabled}
+          loading={syncingServerKey === record.serverKey}
+          onClick={() => {
+            void handleSyncTools(record);
+          }}
+        >
+          同步工具
+        </Button>
+      ),
+    },
+  ];
+
+  const toolColumns: ColumnsType<McpToolItem> = [
+    {
+      title: "Tool",
+      dataIndex: "toolName",
+      key: "toolName",
+      width: 220,
+      render: (value: string) => <Text code>{value}</Text>,
+    },
+    {
+      title: "显示名",
+      dataIndex: "displayName",
+      key: "displayName",
+      width: 140,
+    },
+    {
+      title: "来源",
+      dataIndex: "source",
+      key: "source",
+      width: 100,
+      render: (value: string) => (
+        <Tag color={value === "builtin" ? "blue" : "purple"}>{value}</Tag>
+      ),
+    },
+    {
+      title: "描述",
+      dataIndex: "description",
+      key: "description",
+      render: (value: string) => (
+        <Typography.Text ellipsis={{ tooltip: value }} style={{ maxWidth: 300 }}>
+          {value}
+        </Typography.Text>
+      ),
+    },
+    {
+      title: "启用",
+      dataIndex: "enabled",
+      key: "enabled",
+      width: 100,
+      render: (_: boolean, record) => (
+        <Switch
+          checked={record.enabled}
+          onChange={(checked) => {
+            void toggleTool(record, checked);
+          }}
+        />
+      ),
+    },
+  ];
+
   return (
-    <div className="settings-view page-stack">
+    <div className="page-stack settings-view">
       {contextHolder}
 
-      {/* Hero Section */}
-      <Card className="hero-card hero-card--settings">
-        <div className="hero-card__grid">
-          <div>
-            <Typography.Text className="hero-card__eyebrow">
-              系统设置
-            </Typography.Text>
-            <Typography.Title level={3} className="hero-card__title">
-              精细配置，安全可控
-            </Typography.Title>
-            <Typography.Paragraph className="hero-card__desc">
-              集中管理系统运行参数与安全策略，确保平台稳定、合规运行。
-            </Typography.Paragraph>
-          </div>
-          <div className="hero-card__stats">
-            <div className="hero-stat">
-              <span className="hero-stat__label">配置模块</span>
-              <span className="hero-stat__value">2</span>
-            </div>
-            <div className="hero-stat">
-              <span className="hero-stat__label">配置项</span>
-              <span className="hero-stat__value">8</span>
-            </div>
-          </div>
-        </div>
+      <Card className="panel-card">
+        <Title level={5} className="panel-title">环境信息</Title>
+        <Divider style={{ margin: "12px 0 16px" }} />
+        <Descriptions column={2} bordered size="small">
+          <Descriptions.Item label="运行环境">
+            <Tag color="blue">开发环境</Tag>
+          </Descriptions.Item>
+          <Descriptions.Item label="系统版本">
+            <Tag>v1.1.0</Tag>
+          </Descriptions.Item>
+          <Descriptions.Item label="后端服务">Python FastAPI</Descriptions.Item>
+          <Descriptions.Item label="向量数据库">PostgreSQL + pgvector</Descriptions.Item>
+          <Descriptions.Item label="插件架构">MCP 双轨（builtin + external）</Descriptions.Item>
+          <Descriptions.Item label="调用策略">模型自动调用</Descriptions.Item>
+        </Descriptions>
       </Card>
 
-      {/* Settings Forms Grid */}
-      <div className="settings-grid">
-        {/* Runtime Settings */}
-        <Card className="panel-card">
-          <Typography.Title level={5} className="panel-title">
-            运行环境
-          </Typography.Title>
-          <Typography.Text className="panel-subtitle">
-            链路追踪、并发控制与日志配置
-          </Typography.Text>
-
-          <Divider style={{ margin: "16px 0" }} />
-
-          <Form
-            form={runtimeForm}
-            layout="vertical"
-            initialValues={runtimeDefaults}
-            className="settings-form"
-          >
-            <Form.Item
-              label="环境标识"
-              name="envName"
-              rules={[{ required: true, message: "请输入环境标识" }]}
-            >
-              <Input placeholder="development / staging / production" />
-            </Form.Item>
-
-            <Form.Item
-              label="链路追踪采样率 (%)"
-              name="traceSampling"
-              rules={[{ required: true }]}
-            >
-              <InputNumber min={1} max={100} style={{ width: "100%" }} />
-            </Form.Item>
-
-            <Form.Item
-              label="最大并发任务数"
-              name="maxConcurrentTasks"
-              rules={[{ required: true }]}
-            >
-              <InputNumber min={1} max={64} style={{ width: "100%" }} />
-            </Form.Item>
-
-            <Form.Item
-              label="启用调试日志"
-              name="enableDebugLog"
-              valuePropName="checked"
-            >
-              <Switch />
-            </Form.Item>
-          </Form>
-        </Card>
-
-        {/* Safety Settings */}
-        <Card className="panel-card">
-          <Typography.Title level={5} className="panel-title">
-            安全策略
-          </Typography.Title>
-          <Typography.Text className="panel-subtitle">
-            上传限制、回答策略与引用控制
-          </Typography.Text>
-
-          <Divider style={{ margin: "16px 0" }} />
-
-          <Form
-            form={safetyForm}
-            layout="vertical"
-            initialValues={safetyDefaults}
-            className="settings-form"
-          >
-            <Form.Item
-              label="上传文件白名单"
-              name="uploadWhitelist"
-              rules={[{ required: true, message: "请输入文件白名单" }]}
-            >
-              <Input placeholder="pdf,doc,docx,txt,md" />
-            </Form.Item>
-
-            <Form.Item
-              label="回答策略"
-              name="answerStyle"
-              rules={[{ required: true }]}
-            >
-              <Select
-                options={[
-                  { value: "balanced", label: "均衡模式 - 平衡详细度与简洁度" },
-                  { value: "strict", label: "严谨模式 - 基于证据严格回答" },
-                  { value: "concise", label: "简洁模式 - 精简高效输出" },
-                ]}
-              />
-            </Form.Item>
-
-            <Form.Item
-              label="强制引用来源"
-              name="citationRequired"
-              valuePropName="checked"
-            >
-              <Switch />
-            </Form.Item>
-
-            <Form.Item
-              label="拦截提示词注入"
-              name="blockPromptInjection"
-              valuePropName="checked"
-            >
-              <Switch />
-            </Form.Item>
-          </Form>
-        </Card>
-      </div>
-
-      {/* Action Panel */}
       <Card className="panel-card">
-        <Space orientation="vertical" size={16} style={{ width: "100%" }}>
-          <Alert
-            type="info"
-            showIcon
-            message="配置说明"
-            description="当前配置仅在前端保存，后续可对接后端 API 实现持久化存储。"
-          />
+        <Title level={5} className="panel-title">MCP Server 管理</Title>
+        <Divider style={{ margin: "12px 0 16px" }} />
+        <Alert
+          type="info"
+          showIcon
+          message="说明"
+          description="内置工具默认可用。这里主要管理外部 MCP Server，启用后可被聊天自动调用。"
+          style={{ marginBottom: 16 }}
+        />
+        <Form
+          form={form}
+          layout="inline"
+          onFinish={(values) => {
+            void handleCreateServer(values);
+          }}
+          style={{ marginBottom: 16, rowGap: 8 }}
+        >
+          <Form.Item
+            name="serverKey"
+            rules={[{ required: true, message: "请输入 serverKey" }]}
+          >
+            <Input placeholder="server-key" style={{ width: 160 }} />
+          </Form.Item>
+          <Form.Item
+            name="name"
+            rules={[{ required: true, message: "请输入名称" }]}
+          >
+            <Input placeholder="名称" style={{ width: 160 }} />
+          </Form.Item>
+          <Form.Item
+            name="endpoint"
+            rules={[{ required: true, message: "请输入 endpoint" }]}
+          >
+            <Input placeholder="https://mcp.example.com/invoke" style={{ width: 320 }} />
+          </Form.Item>
+          <Form.Item name="timeoutMs" initialValue={12000}>
+            <Input type="number" placeholder="超时ms" style={{ width: 120 }} />
+          </Form.Item>
+          <Form.Item>
+            <Button htmlType="submit" type="primary" loading={creating}>
+              新增 Server
+            </Button>
+          </Form.Item>
+        </Form>
+        <Table
+          rowKey="serverKey"
+          columns={serverColumns}
+          dataSource={servers}
+          loading={loading}
+          pagination={false}
+          size="small"
+        />
+      </Card>
 
-          <div className="settings-actions">
-            <Button
-              type="primary"
-              loading={saving}
-              onClick={() => void saveSettings()}
-              size="large"
-            >
-              保存配置
-            </Button>
-            <Button
-              size="large"
-              onClick={() => {
-                runtimeForm.setFieldsValue(runtimeDefaults);
-                safetyForm.setFieldsValue(safetyDefaults);
-              }}
-            >
-              恢复默认
-            </Button>
-          </div>
-        </Space>
+      <Card className="panel-card">
+        <Title level={5} className="panel-title">MCP Tool 开关</Title>
+        <Divider style={{ margin: "12px 0 16px" }} />
+        <Table
+          rowKey="toolName"
+          columns={toolColumns}
+          dataSource={tools}
+          loading={loading}
+          pagination={false}
+          size="small"
+        />
+      </Card>
+
+      <Card className="panel-card">
+        <Title level={5} className="panel-title">配置说明</Title>
+        <Divider style={{ margin: "12px 0 16px" }} />
+        <Paragraph type="secondary">
+          MCP 默认自动调用。若需调整策略，可在后端环境变量中设置
+          <Text code> MCP_AUTO_CALL </Text>、
+          <Text code> DEEP_THINK_ENABLED </Text>。
+        </Paragraph>
       </Card>
     </div>
   );

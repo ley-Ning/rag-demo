@@ -6,6 +6,11 @@ type RouteContext = {
   params: Promise<{ modelId: string }>;
 };
 
+export async function GET(request: NextRequest, context: RouteContext) {
+  const { modelId } = await context.params;
+  return proxyJson(request, `/api/v1/models/${encodeURIComponent(modelId)}`, "GET");
+}
+
 export async function PUT(request: NextRequest, context: RouteContext) {
   const { modelId } = await context.params;
   return proxyJson(request, `/api/v1/models/${encodeURIComponent(modelId)}`, "PUT");

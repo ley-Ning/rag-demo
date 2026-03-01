@@ -8,6 +8,7 @@ import {
   EditOutlined,
   PlusOutlined,
   SearchOutlined,
+  ThunderboltOutlined,
 } from "@ant-design/icons";
 import {
   Button,
@@ -33,7 +34,10 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   createModel,
   deleteModel,
+  fetchModelById,
   fetchModels,
+  testModel,
+  TestModelResult,
   updateModel,
   updateModelStatus,
 } from "@/lib/rag-api";
@@ -89,8 +93,10 @@ export default function ModelsPage() {
   const [editorOpen, setEditorOpen] = useState(false);
   const [editingModel, setEditingModel] = useState<ModelItem | null>(null);
   const [saving, setSaving] = useState(false);
+  const [loadingModelDetail, setLoadingModelDetail] = useState(false);
   const [switchingModelId, setSwitchingModelId] = useState<string>();
   const [deletingModelId, setDeletingModelId] = useState<string>();
+  const [testingModelId, setTestingModelId] = useState<string>();
   const [apiMessage, contextHolder] = message.useMessage();
 
   const loadModels = useCallback(
@@ -118,24 +124,44 @@ export default function ModelsPage() {
 
   const openCreateModal = () => {
     setEditingModel(null);
-    form.setFieldsValue(createDefaultFormValues());
     setEditorOpen(true);
   };
 
-  const openEditModal = (model: ModelItem) => {
+  const openEditModal = async (model: ModelItem) => {
+    setLoadingModelDetail(true);
     setEditingModel(model);
-    form.setFieldsValue({
-      id: model.id,
-      name: model.name,
-      provider: model.provider,
-      capabilities: model.capabilities,
-      status: model.status,
-      maxTokens: model.maxTokens,
-      baseUrl: model.baseUrl,
-      apiKey: model.apiKey,
-    });
     setEditorOpen(true);
+    try {
+      const detail = await fetchModelById(model.id);
+      setEditingModel(detail);
+    } catch (error) {
+      apiMessage.warning((error as Error).message || "模型详情加载失败，已使用列表数据");
+    } finally {
+      setLoadingModelDetail(false);
+    }
   };
+
+  useEffect(() => {
+    if (!editorOpen) {
+      return;
+    }
+
+    if (!editingModel) {
+      form.setFieldsValue(createDefaultFormValues());
+      return;
+    }
+
+    form.setFieldsValue({
+      id: editingModel.id,
+      name: editingModel.name,
+      provider: editingModel.provider,
+      capabilities: editingModel.capabilities,
+      status: editingModel.status,
+      maxTokens: editingModel.maxTokens,
+      baseUrl: editingModel.baseUrl,
+      apiKey: editingModel.apiKey,
+    });
+  }, [editorOpen, editingModel, form]);
 
   const closeEditorModal = () => {
     setEditorOpen(false);
@@ -204,6 +230,27 @@ export default function ModelsPage() {
       apiMessage.error((error as Error).message || "模型删除失败");
     } finally {
       setDeletingModelId(undefined);
+    }
+  };
+
+  const handleTestModel = async (model: ModelItem) => {
+    setTestingModelId(model.id);
+    try {
+      const result: TestModelResult = await testModel(model.id);
+      if (result.success) {
+        apiMessage.success(
+          `${model.name} 测试成功 (${result.latency_ms}ms)`,
+        );
+      } else {
+        apiMessage.error({
+          content: `${model.name} 测试失败: ${result.message}`,
+          duration: 5,
+        });
+      }
+    } catch (error) {
+      apiMessage.error((error as Error).message || "模型测试失败");
+    } finally {
+      setTestingModelId(undefined);
     }
   };
 
@@ -367,7 +414,7 @@ export default function ModelsPage() {
       {
         title: "操作",
         key: "actions",
-        width: 228,
+        width: 280,
         render: (_, record) => (
           <Space size={8} wrap className="model-actions">
             <Switch
@@ -378,6 +425,15 @@ export default function ModelsPage() {
               loading={switchingModelId === record.id}
               onChange={(checked) => void toggleModelStatus(record, checked)}
             />
+            <Button
+              type="text"
+              size="small"
+              icon={<ThunderboltOutlined />}
+              loading={testingModelId === record.id}
+              onClick={() => void handleTestModel(record)}
+            >
+              测试
+            </Button>
             <Button
               type="text"
               size="small"
@@ -411,38 +467,12 @@ export default function ModelsPage() {
         ),
       },
     ],
-    [deletingModelId, switchingModelId],
+    [deletingModelId, switchingModelId, testingModelId],
   );
 
   return (
     <div className="models-view page-stack">
       {contextHolder}
-
-      <Card className="hero-card hero-card--models">
-        <div className="hero-card__grid">
-          <div>
-            <Typography.Text className="hero-card__eyebrow">
-              模型管理
-            </Typography.Text>
-            <Typography.Title level={3} className="hero-card__title">
-              统一管控，一目了然
-            </Typography.Title>
-            <Typography.Paragraph className="hero-card__desc">
-              新增、编辑、启停、删除都走后端真实接口，聊天页可用模型会自动联动。
-            </Typography.Paragraph>
-          </div>
-          <div className="hero-card__stats">
-            <div className="hero-stat">
-              <span className="hero-stat__label">模型总数</span>
-              <span className="hero-stat__value">{models.length}</span>
-            </div>
-            <div className="hero-stat">
-              <span className="hero-stat__label">可用对话</span>
-              <span className="hero-stat__value">{onlineChatModels.length}</span>
-            </div>
-          </div>
-        </div>
-      </Card>
 
       <div className="metric-row">
         <Card className="metric-card">
@@ -507,7 +537,7 @@ export default function ModelsPage() {
             showSizeChanger: false,
             showTotal: (total) => `共 ${total} 个模型`,
           }}
-          scroll={{ x: 1260 }}
+          scroll={{ x: 1430 }}
           className="models-table"
           rowClassName={(record) =>
             record.status === "online" ? "models-table__row--online" : ""
@@ -523,12 +553,12 @@ export default function ModelsPage() {
         confirmLoading={saving}
         onOk={() => void submitEditorModal()}
         onCancel={closeEditorModal}
-        destroyOnClose
+        destroyOnHidden
       >
         <Form
           form={form}
           layout="vertical"
-          initialValues={createDefaultFormValues()}
+          disabled={loadingModelDetail}
           preserve={false}
         >
           <Form.Item

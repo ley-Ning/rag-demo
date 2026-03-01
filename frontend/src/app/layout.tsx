@@ -1,4 +1,4 @@
-import type { Metadata } from "next";
+import type { Metadata, Viewport } from "next";
 import { AntdRegistry } from "@ant-design/nextjs-registry";
 import { JetBrains_Mono, Noto_Sans_SC, Noto_Serif_SC } from "next/font/google";
 
@@ -33,7 +33,12 @@ export const metadata: Metadata = {
   description: "基于向量检索的企业知识问答系统，精准溯源，智能决策",
   keywords: ["RAG", "知识问答", "向量检索", "AI", "企业知识库"],
   authors: [{ name: "玄武智库" }],
-  viewport: "width=device-width, initial-scale=1, maximum-scale=1",
+};
+
+export const viewport: Viewport = {
+  width: "device-width",
+  initialScale: 1,
+  maximumScale: 1,
 };
 
 export default function RootLayout({

@@ -1,0 +1,13 @@
+import { NextRequest } from "next/server";
+
+import { proxyJson } from "@/app/api/_shared/proxy";
+
+type RouteContext = {
+  params: Promise<{ documentId: string }>;
+};
+
+export async function GET(request: NextRequest, context: RouteContext) {
+  const { documentId } = await context.params;
+  const query = request.nextUrl.search ?? "";
+  return proxyJson(request, `/api/v1/documents/${encodeURIComponent(documentId)}/chunks${query}`, "GET");
+}
