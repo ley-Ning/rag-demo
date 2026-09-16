@@ -14,8 +14,11 @@ import {
   FileSearchOutlined,
   DeleteOutlined,
   EyeOutlined,
+  WarningOutlined,
+  PlayCircleOutlined,
 } from "@ant-design/icons";
 import {
+  Badge,
   Button,
   Card,
   Empty,
@@ -33,6 +36,7 @@ import {
   Switch,
   Tabs,
   Tag,
+  Tooltip,
   Typography,
   Upload,
   message,
@@ -44,11 +48,14 @@ import {
   deleteDocument,
   fetchDocumentChunks,
   fetchDocuments,
+  fetchDocumentsDlq,
+  purgeDocumentsDlq,
+  replayDocumentsDlq,
   splitPreview,
   uploadDocument,
 } from "@/lib/rag-api";
 import type { DocumentChunksResult } from "@/lib/rag-api";
-import { ChunkPreview, DocumentItem, SplitStrategy } from "@/types/rag";
+import { ChunkPreview, DocumentItem, DlqItem, SplitStrategy } from "@/types/rag";
 
 const splitStrategyOptions: Array<{
   label: string;
@@ -128,6 +135,19 @@ function formatStrategyLabel(strategy: string | null | undefined) {
   return strategy;
 }
 
+function renderDlqReasonLabel(reason: string) {
+  if (reason === "non-retryable") {
+    return "业务失败";
+  }
+  if (reason === "retry-exhausted") {
+    return "重试耗尽";
+  }
+  if (reason === "invalid-payload") {
+    return "非法消息";
+  }
+  return reason || "-";
+}
+
 function renderStatusTag(status: string) {
   const normalized = status.toLowerCase();
   if (normalized === "completed") {
@@ -143,6 +163,14 @@ function renderStatusTag(status: string) {
       <Tag className="document-status-tag document-status-tag--processing">
         <SyncOutlined spin />
         处理中
+      </Tag>
+    );
+  }
+  if (normalized === "retrying") {
+    return (
+      <Tag className="document-status-tag document-status-tag--processing">
+        <ReloadOutlined spin />
+        重试中
       </Tag>
     );
   }
@@ -188,6 +216,11 @@ export default function DocumentsPage() {
   const [chunksKeyword, setChunksKeyword] = useState("");
   const [jumpChunkIndex, setJumpChunkIndex] = useState<number>();
   const [activeChunkIndex, setActiveChunkIndex] = useState<number>();
+  const [dlqModalOpen, setDlqModalOpen] = useState(false);
+  const [dlqItems, setDlqItems] = useState<DlqItem[]>([]);
+  const [dlqTotal, setDlqTotal] = useState(0);
+  const [loadingDlq, setLoadingDlq] = useState(false);
+  const [dlqActionLoading, setDlqActionLoading] = useState(false);
   const [apiMessage, contextHolder] = message.useMessage();
 
   const canPreview = useMemo(() => content.trim().length > 0, [content]);
@@ -288,6 +321,54 @@ export default function DocumentsPage() {
     setOriginalModalOpen(true);
   };
 
+  const loadDlq = useCallback(
+    async (limit = 100) => {
+      setLoadingDlq(true);
+      try {
+        const result = await fetchDocumentsDlq(limit);
+        setDlqItems(result.items);
+        setDlqTotal(result.total);
+      } catch (error) {
+        apiMessage.error((error as Error).message || "死信队列加载失败");
+      } finally {
+        setLoadingDlq(false);
+      }
+    },
+    [apiMessage],
+  );
+
+  const handleOpenDlqModal = () => {
+    setDlqModalOpen(true);
+    void loadDlq();
+  };
+
+  const handleReplayDlq = async (taskIds: string[] = []) => {
+    setDlqActionLoading(true);
+    try {
+      const result = await replayDocumentsDlq(taskIds);
+      apiMessage.success(`已重播 ${result.replayedCount} 条消息到处理队列`);
+      await loadDlq();
+      void loadDocuments("refresh");
+    } catch (error) {
+      apiMessage.error((error as Error).message || "死信重播失败");
+    } finally {
+      setDlqActionLoading(false);
+    }
+  };
+
+  const handlePurgeDlq = async () => {
+    setDlqActionLoading(true);
+    try {
+      const result = await purgeDocumentsDlq();
+      apiMessage.success(`已清空 ${result.purged} 条死信消息`);
+      await loadDlq();
+    } catch (error) {
+      apiMessage.error((error as Error).message || "死信清空失败");
+    } finally {
+      setDlqActionLoading(false);
+    }
+  };
+
   const loadDocumentChunks = useCallback(
     async (documentId: string, page = 1, pageSize = 20) => {
       setLoadingChunks(true);
@@ -348,6 +429,12 @@ export default function DocumentsPage() {
   useEffect(() => {
     void loadDocuments("init");
   }, [loadDocuments]);
+
+  useEffect(() => {
+    // 挂载时只取死信总数（limit=1，避免整队列检视），打开弹窗时再拉全量
+    void loadDlq(1);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => {
     if (!autoPreview || !canPreview) {
@@ -654,6 +741,7 @@ export default function DocumentsPage() {
                           { label: "全部", value: "all" },
                           { label: "已完成", value: "completed" },
                           { label: "处理中", value: "processing" },
+                          { label: "重试中", value: "retrying" },
                           { label: "排队中", value: "queued" },
                           { label: "失败", value: "failed" },
                         ]}
@@ -665,6 +753,17 @@ export default function DocumentsPage() {
                       >
                         刷新
                       </Button>
+                      <Tooltip title="查看处理失败进入死信队列的任务，可重播或清空">
+                        <Badge count={dlqTotal} size="small" offset={[-4, 4]}>
+                          <Button
+                            size="small"
+                            icon={<WarningOutlined />}
+                            onClick={handleOpenDlqModal}
+                          >
+                            死信队列
+                          </Button>
+                        </Badge>
+                      </Tooltip>
                     </Space>
                     <Tag className="thread-tag">共 {documents.length} 条</Tag>
                   </div>
@@ -916,6 +1015,97 @@ export default function DocumentsPage() {
             </div>
           </div>
         ) : null}
+      </Modal>
+
+      {/* DLQ Modal */}
+      <Modal
+        title={
+          <Space>
+            <WarningOutlined style={{ color: "#faad14" }} />
+            <span>文档死信队列</span>
+            <Tag>{dlqTotal} 条</Tag>
+          </Space>
+        }
+        open={dlqModalOpen}
+        onCancel={() => setDlqModalOpen(false)}
+        width={720}
+        footer={
+          <Space>
+            <Button onClick={() => void loadDlq()} loading={loadingDlq}>
+              刷新
+            </Button>
+            <Popconfirm
+              title="清空死信队列"
+              description="消息将被永久丢弃，关联文档保持失败状态，确定清空？"
+              onConfirm={() => void handlePurgeDlq()}
+            >
+              <Button danger loading={dlqActionLoading}>
+                清空死信
+              </Button>
+            </Popconfirm>
+            <Popconfirm
+              title="重播全部死信"
+              description="所有死信消息将重新入队处理（重试次数清零），确定继续？"
+              onConfirm={() => void handleReplayDlq()}
+            >
+              <Button type="primary" icon={<PlayCircleOutlined />} loading={dlqActionLoading}>
+                重播全部
+              </Button>
+            </Popconfirm>
+          </Space>
+        }
+      >
+        {dlqItems.length === 0 && !loadingDlq ? (
+          <Empty
+            description={dlqTotal > 0 ? `队列中还有 ${dlqTotal} 条，仅展示前 ${dlqItems.length} 条` : "死信队列为空，一切正常"}
+            image={Empty.PRESENTED_IMAGE_SIMPLE}
+          />
+        ) : (
+          <List
+            loading={loadingDlq}
+            dataSource={dlqItems}
+            style={{ maxHeight: 480, overflow: "auto" }}
+            renderItem={(item) => (
+              <List.Item>
+                <div style={{ width: "100%" }}>
+                  <div className="chunk-item__header">
+                    <Space size={8} wrap>
+                      <Typography.Text strong>{item.fileName || "(未知文件)"}</Typography.Text>
+                      <Tag color={item.dlqReason === "retry-exhausted" ? "orange" : "red"}>
+                        {renderDlqReasonLabel(item.dlqReason)}
+                      </Tag>
+                      <Tag>重试 {item.retryCount} 次</Tag>
+                      {!item.payloadValid && <Tag color="volcano">消息体非法</Tag>}
+                    </Space>
+                    {item.taskId && (
+                      <Button
+                        type="text"
+                        size="small"
+                        icon={<PlayCircleOutlined />}
+                        loading={dlqActionLoading}
+                        onClick={() => void handleReplayDlq([item.taskId])}
+                      >
+                        重播
+                      </Button>
+                    )}
+                  </div>
+                  <Typography.Paragraph
+                    type="secondary"
+                    ellipsis={{ rows: 2, expandable: true, symbol: "展开" }}
+                    style={{ marginBottom: 4, fontSize: 12 }}
+                  >
+                    {item.errorClass}: {item.errorMessage || "-"}
+                  </Typography.Paragraph>
+                  <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                    文档 {item.documentId ? item.documentId.slice(0, 8) : "-"} · 任务{" "}
+                    {item.taskId ? item.taskId.slice(0, 13) : "-"} · 入队{" "}
+                    {formatTime(item.dlqEnteredAt)}
+                  </Typography.Text>
+                </div>
+              </List.Item>
+            )}
+          />
+        )}
       </Modal>
     </div>
   );

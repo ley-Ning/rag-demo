@@ -8,6 +8,8 @@ import {
   ConsumptionLogsResult,
   CreateModelRequest,
   DeepThinkRunItem,
+  DlqListResult,
+  DlqReplayResult,
   DocumentListResult,
   DocumentStatusResult,
   McpServerItem,
@@ -150,6 +152,27 @@ export async function deleteDocument(documentId: string): Promise<{ deleted: boo
   const res = await httpDelete<{ deleted: boolean; documentId: string; fileName: string }>(
     `/api/v1/documents/${encodeURIComponent(documentId)}`,
   );
+  return res.data;
+}
+
+// ============== 死信队列 API ==============
+
+export async function fetchDocumentsDlq(limit = 50): Promise<DlqListResult> {
+  const query = new URLSearchParams({ limit: String(limit) });
+  const res = await httpGet<DlqListResult>(`/api/v1/documents/dlq?${query.toString()}`);
+  return res.data;
+}
+
+export async function replayDocumentsDlq(taskIds: string[] = []): Promise<DlqReplayResult> {
+  const res = await httpPost<DlqReplayResult, { taskIds: string[] }>(
+    "/api/v1/documents/dlq/replay",
+    { taskIds },
+  );
+  return res.data;
+}
+
+export async function purgeDocumentsDlq(): Promise<{ purged: number }> {
+  const res = await httpDelete<{ purged: number }>("/api/v1/documents/dlq");
   return res.data;
 }
 

@@ -15,3 +15,6 @@ python-service/.env
 
 # logs
 *.log
+
+# runtime upload artifacts
+python-service/data/uploads/

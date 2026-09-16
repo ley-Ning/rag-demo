@@ -8,16 +8,40 @@ from typing import Any
 import aio_pika
 import asyncpg
 from aio_pika.abc import AbstractIncomingMessage
+from openai import (
+    APIConnectionError,
+    APIStatusError,
+    APITimeoutError,
+    InternalServerError,
+    OpenAIError,
+    RateLimitError,
+)
 
 from app.api.v1.endpoints.documents import _normalize_strategy, _split_text
 from app.core.config import get_settings
 from app.core.database import db_conn_context
+from app.core.rabbitmq import declare_documents_topology
 from app.core.redis_client import get_redis_client
 from app.domain.embedding import get_embedding_service
 from app.domain.models_registry import _registry
 from app.domain.vector_store import get_vector_store
 
 logger = logging.getLogger(__name__)
+
+DLQ_REASON_NON_RETRYABLE = "non-retryable"
+DLQ_REASON_RETRY_EXHAUSTED = "retry-exhausted"
+DLQ_REASON_INVALID_PAYLOAD = "invalid-payload"
+
+
+class NonRetryableTaskError(Exception):
+    """业务性失败：重试也不会成功（文件缺失/格式不支持/配置缺失等），应直接进死信队列"""
+
+
+def _is_retryable_openai_error(exc: OpenAIError) -> bool:
+    """网络/限流/服务端错误可重试；认证、配置、参数类错误重试无意义"""
+    if isinstance(exc, (APIConnectionError, APITimeoutError, RateLimitError, InternalServerError)):
+        return True
+    return isinstance(exc, APIStatusError) and exc.status_code >= 500
 
 
 class DocumentWorker:
@@ -73,17 +97,18 @@ class DocumentWorker:
 
     async def _connect_and_consume(self) -> None:
         self._connection = await aio_pika.connect_robust(self._settings.rabbitmq_url)
-        self._channel = await self._connection.channel()
+        # publisher_confirms=True：重试/死信发布得到 broker 确认后才 ack 原消息
+        self._channel = await self._connection.channel(publisher_confirms=True)
         await self._channel.set_qos(prefetch_count=max(self._settings.document_worker_prefetch, 1))
-        self._queue = await self._channel.declare_queue(
-            self._settings.rabbitmq_documents_queue,
-            durable=True,
-        )
+        topology = await declare_documents_topology(self._channel)
+        self._queue = await self._channel.get_queue(self._settings.rabbitmq_documents_queue)
         self._consumer_tag = await self._queue.consume(self._on_message, no_ack=False)
         logger.info(
-            "Document worker consuming queue=%s prefetch=%s",
+            "Document worker consuming queue=%s prefetch=%s retryTiers=%s dlq=%s",
             self._settings.rabbitmq_documents_queue,
             self._settings.document_worker_prefetch,
+            [item["delaySeconds"] for item in topology["retry"]],
+            self._settings.documents_dlq_queue,
         )
 
     async def _close_consumer(self) -> None:
@@ -96,17 +121,187 @@ class DocumentWorker:
         self._queue = None
         self._consumer_tag = None
 
-    async def _on_message(self, message: AbstractIncomingMessage) -> None:
-        async with message.process(requeue=False):
-            try:
-                payload = json.loads(message.body.decode("utf-8"))
-                if not isinstance(payload, dict):
-                    raise ValueError("queue payload 必须是 JSON 对象")
-            except Exception as exc:
-                logger.error("Invalid queue message, dropped: %s", exc)
-                return
+    @staticmethod
+    def _read_retry_count(headers: dict[str, Any] | None) -> int:
+        if not headers:
+            return 0
+        value = headers.get("x-retry-count", 0)
+        try:
+            return max(int(value), 0)
+        except (TypeError, ValueError):
+            return 0
 
+    async def _publish_disposition(
+        self,
+        *,
+        routing_key: str,
+        body: bytes,
+        headers: dict[str, Any],
+        content_type: str = "application/json",
+    ) -> None:
+        """发布重试/死信消息。发布失败时抛出，由调用方决定不 ack 原消息。"""
+        if self._channel is None or self._channel.is_closed:
+            raise RuntimeError("Document worker channel not available")
+        message = aio_pika.Message(
+            body=body,
+            content_type=content_type,
+            delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
+            timestamp=datetime.now(UTC),
+            headers=headers,
+        )
+        await self._channel.default_exchange.publish(message, routing_key=routing_key)
+
+    @staticmethod
+    def _build_failure_headers(
+        *,
+        original_headers: dict[str, Any] | None,
+        error: BaseException | None,
+        retry_count: int,
+        now_iso: str,
+        extra: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        headers: dict[str, Any] = {"x-retry-count": retry_count}
+        first_failed = (original_headers or {}).get("x-first-failed-at")
+        headers["x-first-failed-at"] = (
+            first_failed if isinstance(first_failed, str) and first_failed else now_iso
+        )
+        if error is not None:
+            headers["x-error-class"] = type(error).__name__
+            headers["x-error-message"] = str(error)[:500]
+        if extra:
+            headers.update(extra)
+        return headers
+
+    async def _publish_retry(
+        self,
+        payload: dict[str, Any],
+        raw_body: bytes,
+        original_headers: dict[str, Any] | None,
+        next_retry_count: int,
+        delay_seconds: int,
+        error: Exception,
+    ) -> None:
+        now_iso = datetime.now(UTC).isoformat()
+        headers = self._build_failure_headers(
+            original_headers=original_headers,
+            error=error,
+            retry_count=next_retry_count,
+            now_iso=now_iso,
+            extra={"x-next-retry-delay-sec": delay_seconds},
+        )
+        await self._publish_disposition(
+            routing_key=self._settings.documents_retry_queue(delay_seconds),
+            body=raw_body,
+            headers=headers,
+        )
+        logger.warning(
+            "Document task scheduled for retry %s/%s in %ss: documentId=%s error=%s",
+            next_retry_count,
+            len(self._settings.document_worker_retry_delays),
+            delay_seconds,
+            payload.get("documentId"),
+            str(error)[:200],
+        )
+
+    async def _publish_dlq(
+        self,
+        payload: dict[str, Any] | None,
+        raw_body: bytes,
+        original_headers: dict[str, Any] | None,
+        retry_count: int,
+        reason: str,
+        error: BaseException | None,
+    ) -> None:
+        now_iso = datetime.now(UTC).isoformat()
+        headers = self._build_failure_headers(
+            original_headers=original_headers,
+            error=error,
+            retry_count=retry_count,
+            now_iso=now_iso,
+            extra={"x-dlq-reason": reason, "x-dlq-entered-at": now_iso},
+        )
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else raw_body
+        await self._publish_disposition(
+            routing_key=self._settings.documents_dlq_queue,
+            body=body,
+            headers=headers,
+            content_type="application/json" if payload is not None else "application/octet-stream",
+        )
+        logger.error(
+            "Document task moved to DLQ: reason=%s retryCount=%s documentId=%s error=%s",
+            reason,
+            retry_count,
+            payload.get("documentId") if payload else "unknown",
+            str(error)[:200] if error else "n/a",
+        )
+
+    async def _on_message(self, message: AbstractIncomingMessage) -> None:
+        try:
+            payload = json.loads(message.body.decode("utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("queue payload 必须是 JSON 对象")
+        except Exception as exc:
+            logger.error("Invalid queue message, moving to DLQ: %s", exc)
+            await self._publish_dlq(
+                payload=None,
+                raw_body=message.body,
+                original_headers=message.headers,
+                retry_count=self._read_retry_count(message.headers),
+                reason=DLQ_REASON_INVALID_PAYLOAD,
+                error=exc,
+            )
+            await message.ack()
+            return
+
+        retry_count = self._read_retry_count(message.headers)
+        try:
             await self._process_task(payload)
+            await message.ack()
+            return
+        except NonRetryableTaskError as exc:
+            disposition = ("dlq", DLQ_REASON_NON_RETRYABLE, exc)
+        except Exception as exc:
+            delays = self._settings.document_worker_retry_delays
+            if retry_count < len(delays):
+                disposition = ("retry", delays[retry_count], exc)
+            else:
+                disposition = ("dlq", DLQ_REASON_RETRY_EXHAUSTED, exc)
+
+        # 处置消息：发布成功才 ack 原消息；发布失败则断开连接让消息重投，绝不丢
+        try:
+            if disposition[0] == "retry":
+                await self._publish_retry(
+                    payload,
+                    message.body,
+                    message.headers,
+                    retry_count + 1,
+                    disposition[1],
+                    disposition[2],
+                )
+                await self._mark_document_retrying(payload, retry_count + 1, disposition[1], disposition[2])
+            else:
+                await self._publish_dlq(
+                    payload,
+                    message.body,
+                    message.headers,
+                    retry_count,
+                    disposition[1],
+                    disposition[2],
+                )
+                await self._mark_document_failed(payload, retry_count, disposition[1], disposition[2])
+        except Exception:
+            logger.exception(
+                "Failed to dispose failed message, closing connection for redelivery: documentId=%s",
+                payload.get("documentId"),
+            )
+            if self._connection is not None and not self._connection.is_closed:
+                try:
+                    await self._connection.close()
+                except Exception:
+                    logger.exception("Failed to close worker connection after disposition error")
+            return
+
+        await message.ack()
 
     def _resolve_embedding_model_id(self) -> str:
         preferred = self._settings.document_worker_embedding_model_id.strip()
@@ -162,11 +357,15 @@ class DocumentWorker:
         }
         if extra:
             payload.update(extra)
-        await get_redis_client().set_json(
-            f"{self._settings.redis_key_prefix}:task:{task_id}",
-            payload,
-            ttl_seconds=3600,
-        )
+        try:
+            await get_redis_client().set_json(
+                f"{self._settings.redis_key_prefix}:task:{task_id}",
+                payload,
+                ttl_seconds=3600,
+            )
+        except Exception:
+            # Redis 只是状态缓存，DB 才是事实来源；缓存失败不阻断任务
+            logger.warning("Failed to refresh task cache in Redis: taskId=%s status=%s", task_id, status)
 
     async def _update_document_status(
         self,
@@ -188,6 +387,87 @@ class DocumentWorker:
             document_id,
             status,
             json.dumps(metadata_patch, ensure_ascii=False),
+        )
+
+    async def _cleanup_document_chunks(self, document_id: str) -> None:
+        try:
+            async with db_conn_context() as conn:
+                await get_vector_store().delete_document_chunks(conn, document_id)
+        except Exception:
+            logger.warning(
+                "Failed to cleanup partial chunks (best-effort): documentId=%s", document_id
+            )
+
+    async def _mark_document_retrying(
+        self,
+        payload: dict[str, Any],
+        next_retry_count: int,
+        delay_seconds: int,
+        error: Exception,
+    ) -> None:
+        document_id = str(payload.get("documentId", "")).strip()
+        if not document_id:
+            return
+        await self._cleanup_document_chunks(document_id)
+        try:
+            async with db_conn_context() as conn:
+                await self._update_document_status(
+                    conn,
+                    document_id,
+                    status="retrying",
+                    metadata_patch={
+                        "retryCount": next_retry_count,
+                        "nextRetryDelaySec": delay_seconds,
+                        "workerError": str(error)[:500],
+                        "lastFailedAt": datetime.now(UTC).isoformat(),
+                    },
+                )
+        except Exception:
+            logger.warning(
+                "Failed to mark document as retrying (will recover on next attempt): documentId=%s",
+                document_id,
+            )
+
+        await self._set_task_cache(
+            str(payload.get("taskId", "")).strip(),
+            document_id=document_id,
+            trace_id=str(payload.get("traceId", "")).strip() or "worker-trace",
+            status="retrying",
+            extra={"retryCount": next_retry_count, "nextRetryDelaySec": delay_seconds},
+        )
+
+    async def _mark_document_failed(
+        self,
+        payload: dict[str, Any],
+        retry_count: int,
+        dlq_reason: str,
+        error: BaseException,
+    ) -> None:
+        document_id = str(payload.get("documentId", "")).strip()
+        if not document_id:
+            return
+        try:
+            async with db_conn_context() as conn:
+                await self._update_document_status(
+                    conn,
+                    document_id,
+                    status="failed",
+                    metadata_patch={
+                        "retryCount": retry_count,
+                        "dlqReason": dlq_reason,
+                        "finalError": str(error)[:500],
+                        "lastFailedAt": datetime.now(UTC).isoformat(),
+                    },
+                )
+        except Exception:
+            logger.warning("Failed to persist document failed status: documentId=%s", document_id)
+
+        await self._set_task_cache(
+            str(payload.get("taskId", "")).strip(),
+            document_id=document_id,
+            trace_id=str(payload.get("traceId", "")).strip() or "worker-trace",
+            status="failed",
+            extra={"error": str(error)[:500], "dlqReason": dlq_reason},
         )
 
     @staticmethod
@@ -236,8 +516,7 @@ class DocumentWorker:
         storage_path = str(payload.get("storagePath", "")).strip()
 
         if not document_id:
-            logger.error("Document worker dropped message: documentId missing")
-            return
+            raise NonRetryableTaskError("消息缺少 documentId，无法关联文档记录")
 
         strategy_raw = str(payload.get("strategy", "fixed"))
         try:
@@ -253,124 +532,114 @@ class DocumentWorker:
             extra={"fileName": file_name, "strategy": strategy},
         )
 
-        try:
-            async with db_conn_context() as conn:
-                await self._update_document_status(
-                    conn,
-                    document_id,
-                    status="processing",
-                    metadata_patch={
-                        "workerStartedAt": datetime.now(UTC).isoformat(),
-                        "strategy": strategy,
-                        "storagePath": storage_path,
-                    },
-                )
-
-            text = self._read_text_file(storage_path, file_name)
-            chunks = _split_text(
-                text,
-                chunk_size=max(self._settings.document_worker_chunk_size, 100),
-                overlap=max(self._settings.document_worker_overlap, 0),
-                strategy=strategy,
+        async with db_conn_context() as conn:
+            await self._update_document_status(
+                conn,
+                document_id,
+                status="processing",
+                metadata_patch={
+                    "workerStartedAt": datetime.now(UTC).isoformat(),
+                    "strategy": strategy,
+                    "storagePath": storage_path,
+                },
             )
-            if not chunks:
-                raise RuntimeError("文档切分后无有效分块")
 
+        # 业务性失败（文件/格式/模型配置问题）：重试无意义，直接进死信
+        try:
+            text = self._read_text_file(storage_path, file_name)
+        except Exception as exc:
+            raise NonRetryableTaskError(str(exc)) from exc
+
+        chunks = _split_text(
+            text,
+            chunk_size=max(self._settings.document_worker_chunk_size, 100),
+            overlap=max(self._settings.document_worker_overlap, 0),
+            strategy=strategy,
+        )
+        if not chunks:
+            raise NonRetryableTaskError("文档切分后无有效分块")
+
+        try:
             embedding_model_id = self._resolve_embedding_model_id()
-            embedding_service = get_embedding_service()
-            vector_store = get_vector_store()
+        except Exception as exc:
+            raise NonRetryableTaskError(str(exc)) from exc
 
-            total_prompt_tokens = 0
-            total_embedding_tokens = 0
-            inserted_chunks = 0
+        embedding_service = get_embedding_service()
+        vector_store = get_vector_store()
 
-            base_chunk_meta = {
-                "file_name": file_name,
-                "strategy": strategy,
-                "taskId": task_id,
-                "traceId": trace_id,
-                "storagePath": storage_path,
-            }
+        total_prompt_tokens = 0
+        total_embedding_tokens = 0
+        inserted_chunks = 0
 
-            async with db_conn_context() as conn:
-                await vector_store.delete_document_chunks(conn, document_id)
-                for chunk_index, chunk in enumerate(chunks, start=1):
-                    chunk_content = str(chunk.get("content", "")).strip()
-                    if not chunk_content:
-                        continue
+        base_chunk_meta = {
+            "file_name": file_name,
+            "strategy": strategy,
+            "taskId": task_id,
+            "traceId": trace_id,
+            "storagePath": storage_path,
+        }
 
+        # embedding/DB 等基础设施工况导致的异常原样抛出，由 _on_message 分类为可重试；
+        # 但 openai 的认证/配置/参数类错误属于部署问题，重试无意义，直接判不可重试
+        async with db_conn_context() as conn:
+            await vector_store.delete_document_chunks(conn, document_id)
+            for chunk_index, chunk in enumerate(chunks, start=1):
+                chunk_content = str(chunk.get("content", "")).strip()
+                if not chunk_content:
+                    continue
+
+                try:
                     embedding, usage = await embedding_service.embed_single_with_usage(
                         chunk_content,
                         embedding_model_id,
                         _registry,
                     )
-                    total_prompt_tokens += usage.prompt_tokens
-                    total_embedding_tokens += usage.total_tokens
+                except OpenAIError as exc:
+                    if not _is_retryable_openai_error(exc):
+                        raise NonRetryableTaskError(
+                            f"embedding 调用失败（配置/鉴权类错误）: {exc}"
+                        ) from exc
+                    raise
+                total_prompt_tokens += usage.prompt_tokens
+                total_embedding_tokens += usage.total_tokens
 
-                    chunk_metadata = self._build_chunk_metadata(base=base_chunk_meta, chunk=chunk)
-                    await vector_store.insert_chunk(
-                        conn,
-                        document_id=document_id,
-                        chunk_index=chunk_index,
-                        content=chunk_content,
-                        embedding=embedding,
-                        metadata=chunk_metadata,
-                        embedding_model=embedding_model_id,
-                    )
-                    inserted_chunks += 1
-
-                await self._update_document_status(
+                chunk_metadata = self._build_chunk_metadata(base=base_chunk_meta, chunk=chunk)
+                await vector_store.insert_chunk(
                     conn,
-                    document_id,
-                    status="completed",
-                    metadata_patch={
-                        "embeddingModelId": embedding_model_id,
-                        "chunkCount": inserted_chunks,
-                        "promptTokens": total_prompt_tokens,
-                        "embeddingTokens": total_embedding_tokens,
-                    },
+                    document_id=document_id,
+                    chunk_index=chunk_index,
+                    content=chunk_content,
+                    embedding=embedding,
+                    metadata=chunk_metadata,
+                    embedding_model=embedding_model_id,
                 )
-
-            await self._set_task_cache(
-                task_id,
-                document_id=document_id,
-                trace_id=trace_id,
+                inserted_chunks += 1
+            await self._update_document_status(
+                conn,
+                document_id,
                 status="completed",
-                extra={"chunkCount": inserted_chunks, "embeddingModelId": embedding_model_id},
+                metadata_patch={
+                    "embeddingModelId": embedding_model_id,
+                    "chunkCount": inserted_chunks,
+                    "promptTokens": total_prompt_tokens,
+                    "embeddingTokens": total_embedding_tokens,
+                },
             )
-            logger.info(
-                "[%s] Document worker completed: document_id=%s chunks=%s strategy=%s",
-                trace_id,
-                document_id,
-                inserted_chunks,
-                strategy,
-            )
-        except Exception as exc:
-            logger.exception(
-                "[%s] Document worker failed: document_id=%s error=%s",
-                trace_id,
-                document_id,
-                exc,
-            )
-            try:
-                async with db_conn_context() as conn:
-                    await get_vector_store().delete_document_chunks(conn, document_id)
-                    await self._update_document_status(
-                        conn,
-                        document_id,
-                        status="failed",
-                        metadata_patch={"workerError": str(exc)[:500]},
-                    )
-            except Exception:
-                logger.exception("[%s] Failed to persist worker error status", trace_id)
 
-            await self._set_task_cache(
-                task_id,
-                document_id=document_id,
-                trace_id=trace_id,
-                status="failed",
-                extra={"error": str(exc)[:500]},
-            )
+        await self._set_task_cache(
+            task_id,
+            document_id=document_id,
+            trace_id=trace_id,
+            status="completed",
+            extra={"chunkCount": inserted_chunks, "embeddingModelId": embedding_model_id},
+        )
+        logger.info(
+            "[%s] Document worker completed: document_id=%s chunks=%s strategy=%s",
+            trace_id,
+            document_id,
+            inserted_chunks,
+            strategy,
+        )
 
 
 _document_worker = DocumentWorker()

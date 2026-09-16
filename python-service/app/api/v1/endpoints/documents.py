@@ -2,11 +2,13 @@ import json
 import logging
 import mimetypes
 import re
+from datetime import UTC, datetime
 from pathlib import Path as FsPath
 from typing import Any
 from urllib.parse import quote
 from uuid import uuid4
 
+from aio_pika.exceptions import QueueEmpty
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Path, Query, Request, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
@@ -20,6 +22,10 @@ from app.core.response import success
 router = APIRouter(prefix="/documents", tags=["documents"])
 settings = get_settings()
 logger = logging.getLogger(__name__)
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(UTC).isoformat()
 
 
 class SplitPreviewRequest(BaseModel):
@@ -695,6 +701,219 @@ async def list_documents(
         },
         trace_id,
     )
+
+
+def _dlq_headers_dict(headers: Any) -> dict[str, Any]:
+    if isinstance(headers, dict):
+        return headers
+    return {}
+
+
+def _to_dlq_item(message: Any) -> dict[str, Any]:
+    headers = _dlq_headers_dict(message.headers)
+    payload: dict[str, Any] = {}
+    payload_valid = False
+    try:
+        parsed = json.loads(message.body.decode("utf-8"))
+        if isinstance(parsed, dict):
+            payload = parsed
+            payload_valid = True
+    except Exception:
+        payload_valid = False
+
+    def _header_str(key: str) -> str:
+        value = headers.get(key)
+        return str(value) if value is not None else ""
+
+    def _header_int(key: str) -> int:
+        try:
+            return int(headers.get(key, 0))
+        except (TypeError, ValueError):
+            return 0
+
+    return {
+        "taskId": str(payload.get("taskId", "") or ""),
+        "documentId": str(payload.get("documentId", "") or ""),
+        "fileName": str(payload.get("fileName", "") or ""),
+        "strategy": str(payload.get("strategy", "") or ""),
+        "payloadValid": payload_valid,
+        "retryCount": _header_int("x-retry-count"),
+        "dlqReason": _header_str("x-dlq-reason"),
+        "errorClass": _header_str("x-error-class"),
+        "errorMessage": _header_str("x-error-message"),
+        "firstFailedAt": _header_str("x-first-failed-at"),
+        "dlqEnteredAt": _header_str("x-dlq-entered-at"),
+        "redelivered": bool(message.redelivered),
+    }
+
+
+async def _drain_dlq_channel(client: Any, max_count: int) -> tuple[Any, Any, int, list[Any]]:
+    """打开 DLQ 检视通道并按队列深度取消息（避免 get+requeue 循环取到同一条）。
+
+    返回 (channel, queue, depth, messages)；调用方负责回发/ack 并关闭通道。
+    """
+    channel = await client.open_channel()
+    queue = await channel.declare_queue(settings.documents_dlq_queue, durable=True)
+    depth = int(queue.declaration_result.message_count or 0)
+    messages: list[Any] = []
+    for _ in range(min(depth, max_count)):
+        try:
+            message = await queue.get(no_ack=False)
+        except QueueEmpty:
+            break
+        if message is None:
+            break
+        messages.append(message)
+    return channel, queue, depth, messages
+
+
+async def _requeue_dlq_message(client: Any, message: Any) -> None:
+    """把检视过的消息原样放回 DLQ 队尾（先回发再 ack，崩溃时宁可重复不丢失）"""
+    await client.publish_raw(
+        settings.documents_dlq_queue,
+        message.body,
+        headers={
+            **_dlq_headers_dict(message.headers),
+            "x-dlq-requeued-at": _utc_now_iso(),
+        },
+        content_type=message.content_type or "application/octet-stream",
+    )
+    await message.ack()
+
+
+@router.get("/dlq")
+async def list_documents_dlq(
+    request: Request,
+    limit: int = Query(default=20, ge=1, le=100),
+) -> dict[str, object]:
+    """查看死信队列消息（非破坏性：按深度取数后回发队尾，条数不膨胀）"""
+    trace_id = request.headers.get("x-trace-id") or str(uuid4())
+    client = get_rabbitmq_client()
+
+    items: list[dict[str, Any]] = []
+    channel, _queue, depth, messages = await _drain_dlq_channel(client, limit)
+    try:
+        for message in messages:
+            items.append(_to_dlq_item(message))
+            await _requeue_dlq_message(client, message)
+    finally:
+        if not channel.is_closed:
+            await channel.close()
+
+    return success({"items": items, "count": len(items), "total": depth}, trace_id)
+
+
+class DlqReplayRequest(BaseModel):
+    taskIds: list[str] = Field(default_factory=list, max_length=100)
+
+
+@router.post("/dlq/replay")
+async def replay_documents_dlq(
+    request: Request,
+    payload: DlqReplayRequest,
+    conn=Depends(get_db_conn),
+) -> dict[str, object]:
+    """重播死信消息到主队列（retryCount 清零）。taskIds 为空表示全部重播。"""
+    trace_id = request.headers.get("x-trace-id") or str(uuid4())
+    client = get_rabbitmq_client()
+    task_id_filter = {item.strip() for item in payload.taskIds if item.strip()}
+
+    replayed: list[dict[str, Any]] = []
+    skipped_invalid = 0
+    skipped_unmatched = 0
+    channel, _queue, depth, messages = await _drain_dlq_channel(client, 200)
+    try:
+        for message in messages:
+            try:
+                body = json.loads(message.body.decode("utf-8"))
+                if not isinstance(body, dict):
+                    raise ValueError("invalid payload")
+            except Exception:
+                skipped_invalid += 1
+                await _requeue_dlq_message(client, message)
+                continue
+
+            task_id = str(body.get("taskId", "")).strip()
+            document_id = str(body.get("documentId", "")).strip()
+            if task_id_filter and task_id not in task_id_filter:
+                skipped_unmatched += 1
+                await _requeue_dlq_message(client, message)
+                continue
+
+            await client.publish_json(
+                settings.rabbitmq_documents_queue,
+                body,
+                headers={
+                    "x-retry-count": 0,
+                    "x-replayed-from-dlq": True,
+                    "x-replayed-at": _utc_now_iso(),
+                },
+            )
+            if document_id:
+                try:
+                    await conn.execute(
+                        """
+                        UPDATE documents
+                        SET status = 'queued',
+                            metadata = COALESCE(metadata, '{}'::jsonb) || $2::jsonb,
+                            updated_at = NOW()
+                        WHERE id::text = $1
+                          AND deleted_at IS NULL
+                        """,
+                        document_id,
+                        json.dumps(
+                            {
+                                "replayedFromDlq": True,
+                                "replayedAt": _utc_now_iso(),
+                                "previousDlqReason": _dlq_headers_dict(message.headers).get(
+                                    "x-dlq-reason", ""
+                                ),
+                            },
+                            ensure_ascii=False,
+                        ),
+                    )
+                except Exception:
+                    logger.warning(
+                        "[%s] Failed to reset document status on replay: documentId=%s",
+                        trace_id,
+                        document_id,
+                    )
+            await message.ack()
+            replayed.append(
+                {"taskId": task_id, "documentId": document_id, "fileName": body.get("fileName", "")}
+            )
+    finally:
+        if not channel.is_closed:
+            await channel.close()
+
+    return success(
+        {
+            "replayed": replayed,
+            "replayedCount": len(replayed),
+            "skippedInvalid": skipped_invalid,
+            "skippedUnmatched": skipped_unmatched,
+            "totalInDlq": depth,
+        },
+        trace_id,
+    )
+
+
+@router.delete("/dlq")
+async def purge_documents_dlq(request: Request) -> dict[str, object]:
+    """清空死信队列（消息会被丢弃，关联文档状态保持 failed）"""
+    trace_id = request.headers.get("x-trace-id") or str(uuid4())
+    client = get_rabbitmq_client()
+
+    channel = await client.open_channel()
+    try:
+        queue = await channel.declare_queue(settings.documents_dlq_queue, durable=True)
+        purge_result = await queue.purge()
+        purged = int(getattr(purge_result, "message_count", 0) or 0)
+    finally:
+        if not channel.is_closed:
+            await channel.close()
+
+    return success({"purged": purged}, trace_id)
 
 
 @router.get("/{document_id}/status")

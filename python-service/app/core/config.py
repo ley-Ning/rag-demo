@@ -68,6 +68,8 @@ class Settings(BaseSettings):
     document_worker_chunk_size: int = 400
     document_worker_overlap: int = 50
     document_worker_embedding_model_id: str = "text-embedding-3-large"
+    # 失败重试延迟档位（秒），逗号分隔，升序；重试次数耗尽后进入死信队列
+    document_worker_retry_delays_sec: str = "5,30,120"
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
@@ -112,6 +114,23 @@ class Settings(BaseSettings):
             f"amqp://{self.rabbitmq_user}:{self.rabbitmq_password}"
             f"@{self.rabbitmq_host}:{self.rabbitmq_port}/{self.rabbitmq_vhost}"
         )
+
+    @property
+    def document_worker_retry_delays(self) -> list[int]:
+        delays: list[int] = []
+        for part in self.document_worker_retry_delays_sec.split(","):
+            value = int(part.strip())
+            if value >= 1:
+                delays.append(value)
+        # 去重并升序，保证档位语义稳定
+        return sorted(set(delays))
+
+    @property
+    def documents_dlq_queue(self) -> str:
+        return f"{self.rabbitmq_documents_queue}.dlq"
+
+    def documents_retry_queue(self, delay_seconds: int) -> str:
+        return f"{self.rabbitmq_documents_queue}.retry.{delay_seconds}s"
 
 
 @lru_cache

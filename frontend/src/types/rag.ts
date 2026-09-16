@@ -150,6 +150,39 @@ export interface DocumentListResult {
   total: number;
 }
 
+export interface DlqItem {
+  taskId: string;
+  documentId: string;
+  fileName: string;
+  strategy: string;
+  payloadValid: boolean;
+  retryCount: number;
+  dlqReason: string;
+  errorClass: string;
+  errorMessage: string;
+  firstFailedAt: string;
+  dlqEnteredAt: string;
+  redelivered: boolean;
+}
+
+export interface DlqListResult {
+  items: DlqItem[];
+  count: number;
+  total: number;
+}
+
+export interface DlqReplayResult {
+  replayed: Array<{
+    taskId: string;
+    documentId: string;
+    fileName: string;
+  }>;
+  replayedCount: number;
+  skippedInvalid: number;
+  skippedUnmatched: number;
+  totalInDlq: number;
+}
+
 export interface DocumentStatusResult {
   documentId: string;
   fileName: string;
