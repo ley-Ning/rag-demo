@@ -214,6 +214,33 @@ class DatabasePool:
             "CREATE INDEX IF NOT EXISTS idx_chat_messages_created_at ON chat_messages(created_at)",
         ]
 
+        # 问答答案缓存表（语义命中：问题向量近邻检索）
+        vector_dim = get_settings().vector_dimension
+        create_answer_cache_sql = f"""
+        CREATE TABLE IF NOT EXISTS answer_cache (
+            id BIGSERIAL PRIMARY KEY,
+            cache_key TEXT UNIQUE NOT NULL,
+            question TEXT NOT NULL,
+            question_embedding VECTOR({vector_dim}) NOT NULL,
+            answer TEXT NOT NULL,
+            references_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+            model_id TEXT NOT NULL,
+            embedding_model_id TEXT NOT NULL,
+            kb_version BIGINT NOT NULL DEFAULT 0,
+            hit_count INTEGER NOT NULL DEFAULT 1,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """
+        answer_cache_index_statements = [
+            "CREATE INDEX IF NOT EXISTS idx_answer_cache_model_kb ON answer_cache(model_id, kb_version)",
+            "CREATE INDEX IF NOT EXISTS idx_answer_cache_created_at ON answer_cache(created_at DESC)",
+            (
+                "CREATE INDEX IF NOT EXISTS idx_answer_cache_embedding "
+                "ON answer_cache USING hnsw (question_embedding vector_cosine_ops)"
+            ),
+        ]
+
         async with self._pool.acquire() as conn:
             await conn.execute(create_retrieval_table_sql)
             for sql in alter_statements:
@@ -229,6 +256,10 @@ class DatabasePool:
             await conn.execute(create_chat_sessions_sql)
             await conn.execute(create_chat_messages_sql)
             for sql in chat_index_statements:
+                await conn.execute(sql)
+            # 问答答案缓存表
+            await conn.execute(create_answer_cache_sql)
+            for sql in answer_cache_index_statements:
                 await conn.execute(sql)
 
     async def close(self) -> None:

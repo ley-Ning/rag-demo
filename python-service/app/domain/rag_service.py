@@ -8,6 +8,7 @@ from openai import AsyncAzureOpenAI
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from app.core.config import get_settings
+from app.domain.answer_cache import CachedAnswer, get_answer_cache_service
 from app.domain.embedding import EmbeddingUsage, get_embedding_service
 from app.domain.models_registry import ModelInfo, ModelRegistry
 from app.domain.vector_store import SearchResult, get_vector_store
@@ -67,6 +68,9 @@ class RAGResponse:
     completion_tokens: int
     total_tokens: int
     skill_calls: list[SkillCallLog]
+    cache_hit: bool = False
+    cache_kind: str = "none"  # none | exact | semantic
+    cache_similarity: float | None = None
 
 
 class RAGExecutionError(RuntimeError):
@@ -139,6 +143,33 @@ class RAGService:
         embedding_service = get_embedding_service()
         vector_store = get_vector_store()
 
+        # 0) 答案缓存：精确命中（Redis），命中则跳过 embedding/检索/生成
+        answer_cache = get_answer_cache_service()
+        kb_version = await answer_cache.get_kb_version()
+        cache_key = answer_cache.build_cache_key(
+            question=question,
+            model_id=model_id,
+            embedding_model_id=embedding_model_id,
+            document_ids=document_ids,
+            kb_version=kb_version,
+        )
+        if self._settings.rag_answer_cache_enabled:
+            cache_start = time.monotonic()
+            cached_exact = await answer_cache.lookup_exact(cache_key)
+            if cached_exact is not None:
+                skill_calls.append(
+                    SkillCallLog(
+                        skill_name="mcp.answer.cache",
+                        status="success",
+                        latency_ms=int((time.monotonic() - cache_start) * 1000),
+                        input_summary="kind=exact",
+                        output_summary=f"answer_chars={len(cached_exact.answer)}",
+                    )
+                )
+                return self._cached_response(
+                    cached_exact, resolved_session_id, model_id, skill_calls
+                )
+
         # 1) MCP skill: embedding
         embedding_start = time.monotonic()
         try:
@@ -183,6 +214,31 @@ class RAGService:
                 total_tokens,
                 skill_calls,
             ) from exc
+
+        # 1.5) 答案缓存：语义命中（问题向量近邻），命中则跳过检索/生成
+        if self._settings.rag_semantic_cache_enabled:
+            cache_start = time.monotonic()
+            cached_semantic = await answer_cache.lookup_semantic(
+                conn,
+                question_embedding=query_embedding,
+                model_id=model_id,
+                embedding_model_id=embedding_model_id,
+                document_ids=document_ids,
+                kb_version=kb_version,
+            )
+            if cached_semantic is not None:
+                skill_calls.append(
+                    SkillCallLog(
+                        skill_name="mcp.answer.cache",
+                        status="success",
+                        latency_ms=int((time.monotonic() - cache_start) * 1000),
+                        input_summary=f"kind=semantic,similarity={cached_semantic.similarity}",
+                        output_summary=f"answer_chars={len(cached_semantic.answer)}",
+                    )
+                )
+                return self._cached_response(
+                    cached_semantic, resolved_session_id, model_id, skill_calls
+                )
 
         # 2) MCP skill: vector search
         search_start = time.monotonic()
@@ -290,6 +346,21 @@ class RAGService:
             ) from exc
 
         references = self._build_references(search_results)
+
+        # 5) 写入答案缓存（best-effort，失败不打断主链路）
+        await answer_cache.store(
+            conn,
+            cache_key=cache_key,
+            question=question,
+            question_embedding=query_embedding,
+            answer=generation.answer,
+            references=references,
+            model_id=model_id,
+            embedding_model_id=embedding_model_id,
+            document_ids=document_ids,
+            kb_version=kb_version,
+        )
+
         return RAGResponse(
             answer=generation.answer,
             references=references,
@@ -299,6 +370,27 @@ class RAGService:
             completion_tokens=completion_tokens,
             total_tokens=total_tokens,
             skill_calls=skill_calls,
+        )
+
+    @staticmethod
+    def _cached_response(
+        cached: CachedAnswer,
+        session_id: str,
+        model_id: str,
+        skill_calls: list[SkillCallLog],
+    ) -> RAGResponse:
+        return RAGResponse(
+            answer=cached.answer,
+            references=cached.references,
+            session_id=session_id,
+            model_id=model_id,
+            prompt_tokens=0,
+            completion_tokens=0,
+            total_tokens=0,
+            skill_calls=skill_calls,
+            cache_hit=True,
+            cache_kind=cached.kind,
+            cache_similarity=cached.similarity,
         )
 
     async def chat_only(

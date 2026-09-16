@@ -61,6 +61,22 @@ class RedisClient:
             return None
         return json.loads(payload)
 
+    async def get_int(self, key: str) -> int | None:
+        if self._client is None:
+            raise RuntimeError("Redis client not initialized")
+        value = await self._client.get(key)
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    async def incr_int(self, key: str) -> int:
+        if self._client is None:
+            raise RuntimeError("Redis client not initialized")
+        return int(await self._client.incr(key))
+
 
 _redis_client = RedisClient()
 

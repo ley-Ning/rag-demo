@@ -18,6 +18,7 @@ from app.core.database import get_db_conn
 from app.core.rabbitmq import get_rabbitmq_client
 from app.core.redis_client import get_redis_client
 from app.core.response import success
+from app.domain.answer_cache import get_answer_cache_service
 
 router = APIRouter(prefix="/documents", tags=["documents"])
 settings = get_settings()
@@ -626,6 +627,7 @@ async def upload_document(
         "storagePath": storage_path,
     }
     await get_rabbitmq_client().publish_json(settings.rabbitmq_documents_queue, queue_payload)
+    await get_answer_cache_service().bump_kb_version()
 
     await get_redis_client().set_json(
         f"{settings.redis_key_prefix}:task:{task_id}",
@@ -1129,6 +1131,7 @@ async def import_document_from_tool_run(
         "storagePath": storage_path,
     }
     await get_rabbitmq_client().publish_json(settings.rabbitmq_documents_queue, queue_payload)
+    await get_answer_cache_service().bump_kb_version()
     await get_redis_client().set_json(
         f"{settings.redis_key_prefix}:task:{task_id}",
         {
@@ -1197,6 +1200,7 @@ async def delete_document(
     if not row:
         raise HTTPException(status_code=404, detail="文档不存在或已被删除")
 
+    await get_answer_cache_service().bump_kb_version()
     logger.info(
         "[%s] Document deleted: document_id=%s, file_name=%s",
         trace_id,

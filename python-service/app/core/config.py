@@ -49,6 +49,13 @@ class Settings(BaseSettings):
     rag_parent_child_expand_window: int = 1
     vector_dimension: int = 1536
 
+    # 问答答案缓存（Redis 精确命中 + pgvector 语义命中）
+    rag_answer_cache_enabled: bool = True
+    rag_answer_cache_ttl_sec: int = 3600
+    rag_semantic_cache_enabled: bool = True
+    rag_semantic_cache_threshold: float = 0.92
+    rag_answer_cache_max_entries: int = 5000
+
     # MCP / Tool Orchestration 配置
     mcp_enabled: bool = True
     mcp_auto_call: bool = True

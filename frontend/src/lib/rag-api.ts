@@ -32,6 +32,9 @@ interface AskStreamDonePayload {
   toolRuns?: ToolRunItem[];
   deepThinkSummary?: string | null;
   deepThinkRuns?: DeepThinkRunItem[];
+  cacheHit?: boolean;
+  cacheKind?: "none" | "exact" | "semantic";
+  cacheSimilarity?: number | null;
 }
 
 export async function fetchModels(): Promise<ModelItem[]> {

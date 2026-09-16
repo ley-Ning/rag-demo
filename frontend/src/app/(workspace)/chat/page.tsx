@@ -9,6 +9,7 @@ import {
   PlusOutlined,
   DeleteOutlined,
   HistoryOutlined,
+  ThunderboltOutlined,
 } from "@ant-design/icons";
 import {
   Button,
@@ -49,6 +50,7 @@ interface ChatTurn {
   }>;
   toolRuns?: ToolRunItem[];
   deepThinkSummary?: string | null;
+  cacheKind?: "none" | "exact" | "semantic";
 }
 
 function formatTurnTime(timestamp: number | string) {
@@ -320,6 +322,7 @@ export default function ChatPage() {
                       ...turn,
                       toolRuns: result.toolRuns || [],
                       deepThinkSummary: result.deepThinkSummary || null,
+                      cacheKind: result.cacheKind || "none",
                     }
                   : turn,
               ),
@@ -465,6 +468,23 @@ export default function ChatPage() {
                       <span className="chat-bubble__name">
                         {turn.role === "user" ? "我" : "AI 助手"}
                       </span>
+                      {turn.role === "assistant" && turn.cacheKind && turn.cacheKind !== "none" && (
+                        <Tooltip
+                          title={
+                            turn.cacheKind === "exact"
+                              ? "完全相同的问题命中缓存，跳过检索与生成"
+                              : "相似问题命中缓存（语义匹配），跳过生成"
+                          }
+                        >
+                          <Tag
+                            icon={<ThunderboltOutlined />}
+                            color={turn.cacheKind === "exact" ? "gold" : "cyan"}
+                            style={{ borderRadius: 6, fontSize: 11, lineHeight: "18px" }}
+                          >
+                            {turn.cacheKind === "exact" ? "缓存·精确" : "缓存·语义"}
+                          </Tag>
+                        </Tooltip>
+                      )}
                       <span className="chat-bubble__time">
                         {formatTurnTime(turn.createdAt)}
                       </span>

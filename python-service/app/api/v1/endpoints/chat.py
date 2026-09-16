@@ -528,6 +528,9 @@ async def ask_question(
                 "toolRuns": [_tool_run_to_dict(item) for item in tool_runs],
                 "deepThinkSummary": deep_think_summary,
                 "deepThinkRuns": [_deep_think_run_to_dict(item) for item in deep_think_runs],
+                "cacheHit": result.cache_hit,
+                "cacheKind": result.cache_kind,
+                "cacheSimilarity": result.cache_similarity,
             },
             trace_id,
         )
@@ -815,6 +818,9 @@ async def ask_question_stream(
                         "toolRuns": [_tool_run_to_dict(item) for item in tool_runs],
                         "deepThinkSummary": deep_think_summary,
                         "deepThinkRuns": [_deep_think_run_to_dict(item) for item in deep_think_runs],
+                        "cacheHit": result.cache_hit,
+                        "cacheKind": result.cache_kind,
+                        "cacheSimilarity": result.cache_similarity,
                     },
                 )
             else:

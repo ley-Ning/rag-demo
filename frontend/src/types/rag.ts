@@ -94,6 +94,9 @@ export interface AskResult {
   toolRuns?: ToolRunItem[];
   deepThinkSummary?: string | null;
   deepThinkRuns?: DeepThinkRunItem[];
+  cacheHit?: boolean;
+  cacheKind?: "none" | "exact" | "semantic";
+  cacheSimilarity?: number | null;
 }
 
 export interface SplitPreviewRequest {
