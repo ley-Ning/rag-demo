@@ -157,6 +157,7 @@ class ToolOrchestrator:
         enable_tools: bool,
         enable_deep_think: bool,
         max_tool_steps: int,
+        external_tools: list[str] | None = None,
     ) -> ToolOrchestrationResult:
         if conn is not None:
             await ensure_builtin_tools(conn)
@@ -311,6 +312,63 @@ class ToolOrchestrator:
                             )
                         )
 
+        # 显式点名的 MCP 工具（含外部标准 MCP server 的工具）：
+        # 回答前调用，输出作为证据注入。自动传 question/query 常见参数名。
+        external_outputs: list[tuple[str, str]] = []
+        if enable_tools and external_tools and conn is not None:
+            gateway = get_mcp_gateway()
+            for tool_name in dict.fromkeys(external_tools):
+                tool_name = str(tool_name).strip()
+                if not tool_name:
+                    continue
+                try:
+                    tool = await get_mcp_tool(conn, tool_name)
+                    if tool is None or not tool.enabled:
+                        raise RuntimeError(f"工具不存在或未启用: {tool_name}")
+                    invoke_result = await gateway.invoke(
+                        conn,
+                        tool_name=tool_name,
+                        args={"question": question, "query": question},
+                        trace_id=trace_id,
+                    )
+                    skill_calls.append(_to_skill_call(invoke_result))
+                    tool_runs.append(_to_tool_run(invoke_result))
+                    if invoke_result.status == "success":
+                        payload_text = str(
+                            invoke_result.output_payload.get("text", "")
+                            or invoke_result.output_summary
+                        ).strip()
+                        if payload_text:
+                            external_outputs.append((tool_name, payload_text))
+                            evidence.append(f"[工具 {tool_name} 输出]\n{payload_text[:2000]}")
+                except Exception as exc:
+                    error_msg = str(exc)
+                    skill_calls.append(
+                        ToolSkillCall(
+                            skill_name=tool_name,
+                            status="failed",
+                            latency_ms=0,
+                            input_summary="explicit",
+                            output_summary="",
+                            error_message=error_msg,
+                        )
+                    )
+                    tool_runs.append(
+                        ToolRunRecord(
+                            tool_name=tool_name,
+                            source="external",
+                            status="failed",
+                            latency_ms=0,
+                            prompt_tokens=0,
+                            completion_tokens=0,
+                            total_tokens=0,
+                            input_summary="explicit",
+                            output_summary="",
+                            output_payload={},
+                            error_message=error_msg,
+                        )
+                    )
+
         if enable_deep_think:
             deep_result = run_deep_think_pipeline(
                 question,
@@ -341,6 +399,11 @@ class ToolOrchestrator:
             context_lines = ["\n[代码沙盒执行结果]"]
             for idx, output in enumerate(sandbox_outputs, start=1):
                 context_lines.append(f"[sandbox-{idx}]\n{output[:2000]}")
+            rewritten_question = f"{rewritten_question}\n\n" + "\n\n".join(context_lines)
+        if external_outputs:
+            context_lines = ["\n[MCP 工具输出]"]
+            for tool_name, output in external_outputs:
+                context_lines.append(f"[{tool_name}]\n{output[:2000]}")
             rewritten_question = f"{rewritten_question}\n\n" + "\n\n".join(context_lines)
         if deep_think_summary:
             rewritten_question = (

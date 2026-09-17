@@ -1,5 +1,7 @@
 from uuid import uuid4
 
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException, Path, Request
 from pydantic import BaseModel, Field
 
@@ -16,6 +18,7 @@ from app.domain.mcp.registry import (
 )
 
 router = APIRouter(prefix="/mcp", tags=["mcp"])
+logger = logging.getLogger(__name__)
 
 
 class CreateMcpServerRequest(BaseModel):
@@ -157,4 +160,93 @@ async def sync_mcp_server_tools(
             "items": synced,
         },
         trace_id,
+    )
+
+
+class InvokeToolRequest(BaseModel):
+    args: dict[str, object] = Field(default_factory=dict)
+
+
+@router.post("/tools/{tool_name}/invoke")
+async def invoke_mcp_tool(
+    payload: InvokeToolRequest,
+    request: Request,
+    tool_name: str = Path(min_length=2, max_length=128),
+    conn=Depends(get_db_conn),
+) -> dict[str, object]:
+    """直接调用已注册工具（内置或外部标准 MCP），用于联调与外部系统集成"""
+    trace_id = request.headers.get("x-trace-id") or str(uuid4())
+    gateway = get_mcp_gateway()
+    args = payload.args if isinstance(payload.args, dict) else {}
+    try:
+        result = await gateway.invoke(
+            conn,
+            tool_name=tool_name,
+            args=args,
+            trace_id=trace_id,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"工具调用失败: {exc}") from exc
+
+    # 与编排链路一致的可观测落库
+    try:
+        await _write_tool_run_for_invoke(conn, trace_id, result)
+    except Exception:
+        logger.warning("[%s] invoke tool-run log skipped", trace_id)
+
+    return success(
+        {
+            "toolName": result.tool_name,
+            "source": result.source,
+            "status": result.status,
+            "latencyMs": result.latency_ms,
+            "inputSummary": result.input_summary,
+            "outputSummary": result.output_summary,
+            "output": result.output_payload,
+            "errorMessage": result.error_message,
+        },
+        trace_id,
+    )
+
+
+async def _write_tool_run_for_invoke(conn, trace_id: str, result) -> None:
+    from app.api.v1.endpoints.chat import _write_retrieval_log, _write_tool_runs
+    from app.domain.tools.orchestrator import ToolRunRecord
+
+    retrieval_log_id = await _write_retrieval_log(
+        conn,
+        trace_id=trace_id,
+        session_id=None,
+        question=f"[manual-invoke] {result.tool_name}",
+        model_id="-",
+        latency_ms=result.latency_ms,
+        prompt_tokens=0,
+        completion_tokens=0,
+        total_tokens=0,
+        mcp_call_count=1,
+        status=result.status,
+        error_message=result.error_message,
+        references=[],
+    )
+    record = ToolRunRecord(
+        tool_name=result.tool_name,
+        source=result.source,
+        status=result.status,
+        latency_ms=result.latency_ms,
+        prompt_tokens=0,
+        completion_tokens=0,
+        total_tokens=0,
+        input_summary=result.input_summary,
+        output_summary=result.output_summary,
+        output_payload=result.output_payload,
+        error_message=result.error_message,
+    )
+    await _write_tool_runs(
+        conn,
+        retrieval_log_id=retrieval_log_id,
+        trace_id=trace_id,
+        session_id=None,
+        tool_runs=[record],
     )

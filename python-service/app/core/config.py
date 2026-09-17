@@ -70,6 +70,9 @@ class Settings(BaseSettings):
     mcp_web_allow_all_domains: bool = True
     mcp_web_max_content_chars: int = 12000
     mcp_web_request_timeout_sec: int = 12
+    # 自暴露 MCP Server（/mcp，标准 Streamable HTTP）；token 为空则不鉴权（仅限内网）
+    mcp_server_enabled: bool = True
+    mcp_server_token: str = ""
 
     # 深度思考编排
     deep_think_enabled: bool = True

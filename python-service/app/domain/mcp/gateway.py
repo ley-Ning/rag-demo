@@ -1,7 +1,6 @@
 import asyncio
 import json
 import time
-import urllib.request
 from dataclasses import dataclass
 from typing import Any
 
@@ -15,6 +14,7 @@ from app.domain.mcp.registry import (
     set_external_tools_enabled_by_server,
     upsert_external_tool,
 )
+from app.domain.mcp.standard_client import call_remote_tool, list_remote_tools
 from app.domain.tools.builtin_sandbox import execute_python_code
 from app.domain.tools.builtin_web_fetch import fetch_and_extract_webpage
 
@@ -31,63 +31,6 @@ class ToolInvokeResult:
     output_summary: str
     output_payload: dict[str, Any]
     error_message: str | None = None
-
-
-def _invoke_external_sync(
-    endpoint: str,
-    payload: dict[str, Any],
-    *,
-    timeout_sec: float,
-    auth_type: str,
-    auth_config: dict[str, Any],
-) -> dict[str, Any]:
-    headers = {"content-type": "application/json"}
-    if auth_type == "bearer":
-        token = str(auth_config.get("token", "")).strip()
-        if token:
-            headers["authorization"] = f"Bearer {token}"
-    req = urllib.request.Request(
-        endpoint,
-        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers=headers,
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=timeout_sec) as response:
-        content = response.read()
-        body = json.loads(content.decode("utf-8", errors="ignore"))
-    if not isinstance(body, dict):
-        raise ValueError("MCP 外部服务响应格式错误")
-    return body
-
-
-def _extract_discovered_tools(payload: dict[str, Any]) -> list[dict[str, Any]]:
-    candidates: Any = payload.get("tools")
-    if candidates is None and isinstance(payload.get("data"), dict):
-        candidates = payload["data"].get("tools")
-    if not isinstance(candidates, list):
-        return []
-    parsed: list[dict[str, Any]] = []
-    for item in candidates:
-        if not isinstance(item, dict):
-            continue
-        raw_name = item.get("toolName", item.get("name", ""))
-        tool_name = str(raw_name).strip()
-        if not tool_name:
-            continue
-        display_name = str(item.get("displayName", item.get("title", tool_name))).strip() or tool_name
-        description = str(item.get("description", "")).strip()
-        schema = item.get("toolSchema", item.get("schema", {}))
-        if not isinstance(schema, dict):
-            schema = {}
-        parsed.append(
-            {
-                "toolName": tool_name,
-                "displayName": display_name,
-                "description": description,
-                "toolSchema": schema,
-            }
-        )
-    return parsed
 
 
 class McpGateway:
@@ -177,36 +120,29 @@ class McpGateway:
         if not server.enabled:
             raise RuntimeError(f"MCP Server 未启用: {tool.server_key}")
 
-        payload = {
-            "toolName": tool_name,
-            "args": args,
-            "traceId": trace_id,
-        }
-        timeout_sec = max(1.0, min(float(server.timeout_ms) / 1000.0, 120.0))
-        body = await asyncio.to_thread(
-            _invoke_external_sync,
+        timeout_sec = max(3.0, min(float(server.timeout_ms) / 1000.0, 120.0))
+        result = await call_remote_tool(
             server.endpoint,
-            payload,
-            timeout_sec=timeout_sec,
+            tool_name=tool_name,
+            args=args,
             auth_type=server.auth_type,
             auth_config=server.auth_config,
+            timeout_sec=timeout_sec,
         )
-        status = str(body.get("status", "success"))
-        data = body.get("data")
-        if not isinstance(data, dict):
-            data = {"raw": data}
-        error_message = body.get("errorMessage")
-        if error_message is not None:
-            error_message = str(error_message)
+        payload = result["payload"]
+        is_error = bool(result["isError"])
+        error_message = None
+        if is_error:
+            error_message = str(payload.get("text", "") or "工具返回错误")[:500]
 
         return ToolInvokeResult(
             tool_name=tool_name,
             source="external",
-            status="failed" if status == "failed" else "success",
+            status="failed" if is_error else "success",
             latency_ms=int((time.monotonic() - start) * 1000),
             input_summary=f"server={tool.server_key},args={len(args)}",
-            output_summary=f"fields={len(data)}",
-            output_payload=data,
+            output_summary=f"fields={len(payload)}",
+            output_payload=payload,
             error_message=error_message,
         )
 
@@ -222,16 +158,13 @@ class McpGateway:
         if not server.enabled:
             raise RuntimeError(f"MCP Server 未启用: {server_key}")
 
-        timeout_sec = max(1.0, min(float(server.timeout_ms) / 1000.0, 120.0))
-        body = await asyncio.to_thread(
-            _invoke_external_sync,
+        timeout_sec = max(3.0, min(float(server.timeout_ms) / 1000.0, 120.0))
+        discovered = await list_remote_tools(
             server.endpoint,
-            {"op": "list_tools"},
-            timeout_sec=timeout_sec,
             auth_type=server.auth_type,
             auth_config=server.auth_config,
+            timeout_sec=timeout_sec,
         )
-        discovered = _extract_discovered_tools(body)
         if not discovered:
             raise RuntimeError("外部 MCP Server 未返回可用 tools")
 

@@ -30,6 +30,8 @@ class AskRequest(BaseModel):
     enableTools: bool | None = None
     enableDeepThink: bool | None = None
     maxToolSteps: int | None = Field(default=None, ge=1, le=12)
+    # 显式点名的 MCP 工具（内置/外部皆可）：回答前先调用，输出注入上下文
+    externalTools: list[str] | None = Field(default=None, max_length=5)
 
 
 # ============== 聊天历史存储函数 ==============
@@ -466,6 +468,7 @@ async def ask_question(
                 enable_tools=enable_tools,
                 enable_deep_think=enable_deep_think,
                 max_tool_steps=max_tool_steps,
+                external_tools=payload.externalTools,
             )
             rewritten_question = orchestration.rewritten_question
             tool_runs = orchestration.tool_runs
@@ -794,6 +797,7 @@ async def ask_question_stream(
                                 enable_tools=enable_tools,
                                 enable_deep_think=enable_deep_think,
                                 max_tool_steps=max_tool_steps,
+                                external_tools=payload.externalTools,
                             )
                             rewritten_question = orchestration.rewritten_question
                             tool_runs = orchestration.tool_runs
@@ -903,6 +907,7 @@ async def ask_question_stream(
                                 enable_tools=enable_tools,
                                 enable_deep_think=enable_deep_think,
                                 max_tool_steps=max_tool_steps,
+                                external_tools=payload.externalTools,
                             )
                             rewritten_question = orchestration.rewritten_question
                             tool_runs = orchestration.tool_runs
