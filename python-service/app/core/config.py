@@ -56,6 +56,12 @@ class Settings(BaseSettings):
     rag_semantic_cache_threshold: float = 0.92
     rag_answer_cache_max_entries: int = 5000
 
+    # 多轮对话记忆
+    chat_history_max_messages: int = 10
+    chat_history_max_chars: int = 8000
+    # 有历史时先把追问改写成独立问题再做检索（改写失败自动退回原问题）
+    chat_question_rewrite_enabled: bool = True
+
     # MCP / Tool Orchestration 配置
     mcp_enabled: bool = True
     mcp_auto_call: bool = True

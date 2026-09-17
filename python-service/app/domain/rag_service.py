@@ -5,7 +5,7 @@ from typing import Any, AsyncIterator
 
 import asyncpg
 from openai import AsyncAzureOpenAI
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import retry, stop_after_attempt, wait_exponential, wait_fixed
 
 from app.core.config import get_settings
 from app.domain.answer_cache import CachedAnswer, get_answer_cache_service
@@ -29,6 +29,39 @@ RAG_SYSTEM_PROMPT = """你是一个智能助手，根据提供的上下文信息
 CHAT_SYSTEM_PROMPT = """你是一个专业、可靠的 AI 助手。
 请直接回答用户问题，表达清晰，避免编造信息。
 """
+
+QUESTION_REWRITE_SYSTEM_PROMPT = """你是对话问题改写助手。请把用户的追问改写成不依赖上下文、可独立理解的问题。
+规则：
+1. 展开追问里的指代（如"它/这个/第二点"），保留追问的全部意图
+2. 只输出改写后的问题本身，不要回答，不要任何解释
+3. 如果追问本身已经是独立问题，原样输出
+"""
+
+
+def _trim_history(
+    history: list[dict[str, Any]] | None,
+    max_messages: int,
+    max_chars: int,
+) -> list[dict[str, Any]]:
+    """裁剪对话历史：保留最近 N 条，并从头裁掉超字符预算的部分"""
+    if not history:
+        return []
+    trimmed: list[dict[str, Any]] = []
+    for item in reversed(history):
+        if len(trimmed) >= max_messages:
+            break
+        role = str(item.get("role", ""))
+        content = str(item.get("content", "") or "").strip()
+        if role not in ("user", "assistant") or not content:
+            continue
+        trimmed.append({"role": role, "content": content})
+
+    trimmed.reverse()
+    total_chars = sum(len(item["content"]) for item in trimmed)
+    while trimmed and total_chars > max_chars:
+        removed = trimmed.pop(0)
+        total_chars -= len(removed["content"])
+    return trimmed
 
 
 @dataclass
@@ -128,6 +161,7 @@ class RAGService:
         embedding_model_id: str = "text-embedding-3-large",
         session_id: str | None = None,
         document_ids: list[str] | None = None,
+        history: list[dict[str, Any]] | None = None,
     ) -> RAGResponse:
         """RAG 问答主流程，附带 token 和 skill 调用明细"""
         resolved_session_id = session_id or f"session-{hash(question) % 1000000:06d}"
@@ -143,6 +177,14 @@ class RAGService:
         embedding_service = get_embedding_service()
         vector_store = get_vector_store()
 
+        # 多轮记忆：带历史的提问依赖会话上下文，不查也不写答案缓存
+        trimmed_history = _trim_history(
+            history,
+            self._settings.chat_history_max_messages,
+            self._settings.chat_history_max_chars,
+        )
+        has_history = bool(trimmed_history)
+
         # 0) 答案缓存：精确命中（Redis），命中则跳过 embedding/检索/生成
         answer_cache = get_answer_cache_service()
         kb_version = await answer_cache.get_kb_version()
@@ -153,7 +195,7 @@ class RAGService:
             document_ids=document_ids,
             kb_version=kb_version,
         )
-        if self._settings.rag_answer_cache_enabled:
+        if self._settings.rag_answer_cache_enabled and not has_history:
             cache_start = time.monotonic()
             cached_exact = await answer_cache.lookup_exact(cache_key)
             if cached_exact is not None:
@@ -170,11 +212,44 @@ class RAGService:
                     cached_exact, resolved_session_id, model_id, skill_calls
                 )
 
+        # 0.5) 追问改写：带历史时把追问展开成独立问题，检索质量才有保障
+        retrieval_question = question
+        if has_history and self._settings.chat_question_rewrite_enabled:
+            rewrite_start = time.monotonic()
+            try:
+                retrieval_question = await self._rewrite_question(
+                    question=question,
+                    history=trimmed_history,
+                    model_id=model_id,
+                    registry=registry,
+                )
+                skill_calls.append(
+                    SkillCallLog(
+                        skill_name="mcp.chat.rewrite",
+                        status="success",
+                        latency_ms=int((time.monotonic() - rewrite_start) * 1000),
+                        input_summary=f"chars={len(question)}",
+                        output_summary=f"rewritten_chars={len(retrieval_question)}",
+                    )
+                )
+            except Exception as exc:
+                retrieval_question = question
+                skill_calls.append(
+                    SkillCallLog(
+                        skill_name="mcp.chat.rewrite",
+                        status="failed",
+                        latency_ms=int((time.monotonic() - rewrite_start) * 1000),
+                        input_summary=f"chars={len(question)}",
+                        output_summary="",
+                        error_message=str(exc),
+                    )
+                )
+
         # 1) MCP skill: embedding
         embedding_start = time.monotonic()
         try:
             query_embedding, embedding_usage = await embedding_service.embed_single_with_usage(
-                question,
+                retrieval_question,
                 embedding_model_id,
                 registry,
             )
@@ -216,7 +291,7 @@ class RAGService:
             ) from exc
 
         # 1.5) 答案缓存：语义命中（问题向量近邻），命中则跳过检索/生成
-        if self._settings.rag_semantic_cache_enabled:
+        if self._settings.rag_semantic_cache_enabled and not has_history:
             cache_start = time.monotonic()
             cached_semantic = await answer_cache.lookup_semantic(
                 conn,
@@ -306,6 +381,7 @@ class RAGService:
                 context=context,
                 model_id=model_id,
                 registry=registry,
+                history=trimmed_history,
             )
             generation_latency_ms = int((time.monotonic() - generation_start) * 1000)
             prompt_tokens += generation.prompt_tokens
@@ -347,19 +423,20 @@ class RAGService:
 
         references = self._build_references(search_results)
 
-        # 5) 写入答案缓存（best-effort，失败不打断主链路）
-        await answer_cache.store(
-            conn,
-            cache_key=cache_key,
-            question=question,
-            question_embedding=query_embedding,
-            answer=generation.answer,
-            references=references,
-            model_id=model_id,
-            embedding_model_id=embedding_model_id,
-            document_ids=document_ids,
-            kb_version=kb_version,
-        )
+        # 5) 写入答案缓存（best-effort，失败不打断主链路；带历史的答案依赖会话上下文，不缓存）
+        if not has_history:
+            await answer_cache.store(
+                conn,
+                cache_key=cache_key,
+                question=question,
+                question_embedding=query_embedding,
+                answer=generation.answer,
+                references=references,
+                model_id=model_id,
+                embedding_model_id=embedding_model_id,
+                document_ids=document_ids,
+                kb_version=kb_version,
+            )
 
         return RAGResponse(
             answer=generation.answer,
@@ -399,15 +476,22 @@ class RAGService:
         model_id: str,
         registry: ModelRegistry,
         session_id: str | None = None,
+        history: list[dict[str, Any]] | None = None,
     ) -> RAGResponse:
         """普通聊天（不走 embedding/向量检索）"""
         resolved_session_id = session_id or f"session-{hash(question) % 1000000:06d}"
+        trimmed_history = _trim_history(
+            history,
+            self._settings.chat_history_max_messages,
+            self._settings.chat_history_max_chars,
+        )
         generation_start = time.monotonic()
         try:
             generation = await self._generate_plain_answer(
                 question=question,
                 model_id=model_id,
                 registry=registry,
+                history=trimmed_history,
             )
         except Exception as exc:
             raise RAGExecutionError(
@@ -457,16 +541,23 @@ class RAGService:
         model_id: str,
         registry: ModelRegistry,
         usage_sink: dict[str, int] | None = None,
+        history: list[dict[str, Any]] | None = None,
     ) -> AsyncIterator[str]:
         """普通聊天流式输出（不走 embedding/向量检索）"""
         model = registry.get_model(model_id)
         client = self._get_chat_client(model)
         deployment_name = model_id
+        trimmed_history = _trim_history(
+            history,
+            self._settings.chat_history_max_messages,
+            self._settings.chat_history_max_chars,
+        )
 
         request_payload = {
             "model": deployment_name,
             "messages": [
                 {"role": "system", "content": CHAT_SYSTEM_PROMPT},
+                *trimmed_history,
                 {"role": "user", "content": question},
             ],
             "temperature": 0.7,
@@ -504,6 +595,43 @@ class RAGService:
         if usage_sink is not None:
             usage_sink.update(usage_stats)
 
+    @staticmethod
+    def _build_messages(
+        system_prompt: str,
+        history: list[dict[str, Any]] | None,
+        question: str,
+    ) -> list[dict[str, str]]:
+        return [
+            {"role": "system", "content": system_prompt},
+            *(history or []),
+            {"role": "user", "content": question},
+        ]
+
+    @retry(
+        stop=stop_after_attempt(2),
+        wait=wait_fixed(2),
+        reraise=True,
+    )
+    async def _rewrite_question(
+        self,
+        question: str,
+        history: list[dict[str, Any]],
+        model_id: str,
+        registry: ModelRegistry,
+    ) -> str:
+        """把追问改写成独立问题（用于检索），失败由调用方回退原问题"""
+        model = registry.get_model(model_id)
+        client = self._get_chat_client(model)
+
+        response = await client.chat.completions.create(
+            model=model_id,
+            messages=self._build_messages(QUESTION_REWRITE_SYSTEM_PROMPT, history, question),
+            temperature=0.0,
+            max_tokens=256,
+        )
+        rewritten = (response.choices[0].message.content or "").strip()
+        return rewritten or question
+
     def _build_context(self, results: list[SearchResult]) -> str:
         """构建上下文字符串"""
         if not results:
@@ -525,6 +653,7 @@ class RAGService:
         context: str,
         model_id: str,
         registry: ModelRegistry,
+        history: list[dict[str, Any]] | None = None,
     ) -> LlmGenerationUsage:
         """调用 LLM 生成回答，并返回 token 使用统计"""
         model = registry.get_model(model_id)
@@ -536,6 +665,7 @@ class RAGService:
             model=deployment_name,
             messages=[
                 {"role": "system", "content": system_prompt},
+                *(history or []),
                 {"role": "user", "content": question},
             ],
             temperature=0.7,
@@ -571,6 +701,7 @@ class RAGService:
         question: str,
         model_id: str,
         registry: ModelRegistry,
+        history: list[dict[str, Any]] | None = None,
     ) -> LlmGenerationUsage:
         """普通聊天模式（不带检索上下文）"""
         model = registry.get_model(model_id)
@@ -581,6 +712,7 @@ class RAGService:
             model=deployment_name,
             messages=[
                 {"role": "system", "content": CHAT_SYSTEM_PROMPT},
+                *(history or []),
                 {"role": "user", "content": question},
             ],
             temperature=0.7,

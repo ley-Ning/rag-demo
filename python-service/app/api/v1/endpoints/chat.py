@@ -81,6 +81,36 @@ async def _ensure_session(
         logger.exception("Failed to ensure session, session=%s", session_id)
 
 
+async def _load_chat_history(conn: asyncpg.Connection, session_id: str) -> list[dict[str, str]]:
+    """加载会话最近的多轮历史（按字符预算从头裁剪），失败降级为空"""
+    try:
+        rows = await conn.fetch(
+            """
+            SELECT role, content
+            FROM chat_messages
+            WHERE session_id = $1 AND role IN ('user', 'assistant')
+            ORDER BY id DESC
+            LIMIT $2
+            """,
+            session_id,
+            settings.chat_history_max_messages,
+        )
+    except Exception:
+        logger.exception("Failed to load chat history, session=%s", session_id)
+        return []
+
+    history = [
+        {"role": row["role"], "content": (row["content"] or "").strip()}
+        for row in reversed(rows)
+    ]
+    history = [item for item in history if item["content"]]
+    total_chars = sum(len(item["content"]) for item in history)
+    while history and total_chars > settings.chat_history_max_chars:
+        removed = history.pop(0)
+        total_chars -= len(removed["content"])
+    return history
+
+
 async def _write_retrieval_log(
     conn: asyncpg.Connection,
     *,
@@ -414,6 +444,12 @@ async def ask_question(
     if payload.useRag and not model_supports(embedding_model_id, "embedding"):
         raise HTTPException(status_code=400, detail=f"Embedding 模型不可用: {embedding_model_id}")
 
+    session_id = payload.sessionId or f"session-{uuid4().hex[:8]}"
+    # 多轮记忆：只在调用方携带已有会话时加载历史（新会话首条消息无需查询）
+    history: list[dict[str, str]] = []
+    if payload.sessionId and conn is not None:
+        history = await _load_chat_history(conn, payload.sessionId)
+
     rewritten_question = payload.question
     orchestration_skill_calls: list[SkillCallLog] = []
     tool_runs: list[ToolRunRecord] = []
@@ -461,17 +497,32 @@ async def ask_question(
                 registry=_registry,
                 conn=conn,
                 embedding_model_id=embedding_model_id,
-                session_id=payload.sessionId,
+                session_id=session_id,
                 document_ids=payload.documentIds,
+                history=history,
             )
         else:
             result = await rag_service.chat_only(
                 question=rewritten_question,
                 model_id=payload.modelId,
                 registry=_registry,
-                session_id=payload.sessionId,
+                session_id=session_id,
+                history=history,
             )
         merged_skill_calls = [*orchestration_skill_calls, *result.skill_calls]
+
+        # 非流式也要积累会话历史（与流式路径对齐），后续追问才有记忆
+        if conn is not None:
+            title = payload.question[:30] + ("..." if len(payload.question) > 30 else "")
+            await _ensure_session(conn, session_id, payload.modelId, payload.useRag, title)
+            await _save_chat_message(conn, session_id, "user", payload.question)
+            await _save_chat_message(
+                conn,
+                session_id,
+                "assistant",
+                result.answer,
+                result.references,
+            )
 
         latency_ms = int((time.monotonic() - start_time) * 1000)
         logger.info(
@@ -729,8 +780,11 @@ async def ask_question_stream(
                         detail=f"Embedding 模型不可用: {embedding_model_id}",
                     )
 
+                history: list[dict[str, str]] = []
                 try:
                     async with db_conn_context() as rag_conn:
+                        if payload.sessionId:
+                            history = await _load_chat_history(rag_conn, payload.sessionId)
                         if settings.mcp_enabled and (enable_tools or enable_deep_think):
                             orchestrator = get_tool_orchestrator()
                             orchestration = await orchestrator.orchestrate(
@@ -770,6 +824,7 @@ async def ask_question_stream(
                             embedding_model_id=embedding_model_id,
                             session_id=session_id,
                             document_ids=payload.documentIds,
+                            history=history,
                         )
                         model_id = result.model_id
                         skill_calls = [*orchestration_skill_calls, *result.skill_calls]
@@ -824,6 +879,19 @@ async def ask_question_stream(
                     },
                 )
             else:
+                chat_history: list[dict[str, str]] = []
+                if payload.sessionId:
+                    try:
+                        async with db_conn_context() as history_conn:
+                            chat_history = await _load_chat_history(
+                                history_conn, payload.sessionId
+                            )
+                    except Exception as exc:
+                        logger.warning(
+                            "[%s] Chat history load skipped in stream chat-only: %s",
+                            trace_id,
+                            exc,
+                        )
                 if settings.mcp_enabled and (enable_tools or enable_deep_think):
                     try:
                         async with db_conn_context() as tool_conn:
@@ -869,6 +937,7 @@ async def ask_question_stream(
                     model_id=payload.modelId,
                     registry=_registry,
                     usage_sink=usage_stats,
+                    history=chat_history,
                 ):
                     full_answer += piece
                     yield _sse_event("chunk", {"text": piece})

@@ -85,12 +85,62 @@ async def chat_completions(
     x_mock_llm_delay_ms: int = Header(default=0),
 ) -> Any:
     messages = body.get("messages") or []
+    system_content = ""
+    for message in messages:
+        if message.get("role") == "system":
+            system_content = str(message.get("content", ""))
+            break
     user_question = ""
     for message in reversed(messages):
         if message.get("role") == "user":
             user_question = str(message.get("content", ""))[:120]
             break
-    answer = f"【模拟回答】关于「{user_question}」的要点：知识库检索命中相关上下文，综合整理如下 [1]。"
+
+    # 追问改写请求（RAG 多轮记忆链路）：透传原问题，便于验证改写调用已发生
+    if "改写" in system_content:
+        rewrite_answer = user_question.strip() or "（空问题）"
+        prompt_tokens = sum(len(str(m.get("content", ""))) for m in messages)
+        return {
+            "id": "mock-chatcmpl-rewrite",
+            "object": "chat.completion",
+            "model": deployment,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": rewrite_answer},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": token_usage(prompt_tokens, len(rewrite_answer)),
+        }
+
+    # 回显对话历史摘要，验证多轮记忆确实送达模型
+    history_messages = [m for m in messages if m.get("role") in ("user", "assistant")][:-1]
+    history_note = ""
+    if history_messages:
+        last_user = next(
+            (
+                str(m.get("content", ""))[:24]
+                for m in reversed(history_messages)
+                if m.get("role") == "user"
+            ),
+            "",
+        )
+        last_assistant = next(
+            (
+                str(m.get("content", ""))[:24]
+                for m in reversed(history_messages)
+                if m.get("role") == "assistant"
+            ),
+            "",
+        )
+        history_note = (
+            f"（已带入{len(history_messages)}条历史｜近user:{last_user}｜近assistant:{last_assistant}）"
+        )
+
+    answer = (
+        f"【模拟回答】关于「{user_question}」的要点：知识库检索命中相关上下文，综合整理如下 [1]。{history_note}"
+    )
 
     prompt_tokens = sum(len(str(m.get("content", ""))) for m in messages)
     usage = token_usage(prompt_tokens, len(answer))
