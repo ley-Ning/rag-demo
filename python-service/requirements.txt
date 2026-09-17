@@ -8,3 +8,4 @@ pgvector>=0.3.0
 tenacity>=8.2.0
 redis>=5.0.8
 aio-pika>=9.5.0
+opensandbox>=0.1.16

@@ -11,6 +11,7 @@ from app.domain.tools.deep_think_pipeline import DeepThinkStageResult, run_deep_
 
 settings = get_settings()
 URL_PATTERN = re.compile(r"https?://[^\s]+", re.IGNORECASE)
+CODE_BLOCK_PATTERN = re.compile(r"```[a-zA-Z0-9_+-]*[ \t]*\r?\n(.*?)```", re.DOTALL)
 
 
 @dataclass
@@ -75,6 +76,32 @@ def _extract_urls(question: str) -> list[str]:
 def _should_try_web_tool(question: str) -> bool:
     lowered = question.lower()
     keywords = ("网页", "网站", "链接", "url", "http://", "https://", "看看", "查看")
+    return any(word in lowered for word in keywords)
+
+
+def _extract_code_blocks(question: str) -> list[str]:
+    blocks: list[str] = []
+    for match in CODE_BLOCK_PATTERN.finditer(question):
+        code = match.group(1).strip()
+        if code:
+            blocks.append(code)
+    return blocks
+
+
+def _should_try_sandbox(question: str) -> bool:
+    lowered = question.lower()
+    keywords = (
+        "运行代码",
+        "执行代码",
+        "跑一下",
+        "跑这段",
+        "代码块",
+        "python",
+        "脚本",
+        "算一下",
+        "计算一下",
+        "帮我算",
+    )
     return any(word in lowered for word in keywords)
 
 
@@ -143,7 +170,10 @@ class ToolOrchestrator:
 
         urls = _extract_urls(question)
         should_try_web = bool(urls) or _should_try_web_tool(question)
+        code_blocks = _extract_code_blocks(question)
+        should_try_sandbox = bool(code_blocks) or _should_try_sandbox(question)
         max_steps = max(1, min(int(max_tool_steps or settings.mcp_max_steps), 12))
+        sandbox_outputs: list[str] = []
 
         if enable_tools and should_try_web and conn is not None:
             web_tool = await get_mcp_tool(conn, "mcp.web.fetch")
@@ -210,6 +240,77 @@ class ToolOrchestrator:
                             )
                         )
 
+        # 代码沙盒：问题里带代码块时在隔离沙盒执行，输出作为证据注入回答上下文
+        if (
+            enable_tools
+            and settings.sandbox_enabled
+            and should_try_sandbox
+            and conn is not None
+        ):
+            sandbox_tool = await get_mcp_tool(conn, "mcp.sandbox.execute")
+            if sandbox_tool and sandbox_tool.enabled and max_steps > 0:
+                gateway = get_mcp_gateway()
+                if not code_blocks:
+                    skill_calls.append(
+                        ToolSkillCall(
+                            skill_name="mcp.sandbox.execute",
+                            status="failed",
+                            latency_ms=0,
+                            input_summary="code=missing",
+                            output_summary="",
+                            error_message="未检测到可执行的代码块，请在问题中用 ```python 代码块 提供代码",
+                        )
+                    )
+                for code in code_blocks[:max_steps]:
+                    try:
+                        invoke_result = await gateway.invoke(
+                            conn,
+                            tool_name="mcp.sandbox.execute",
+                            args={"code": code},
+                            trace_id=trace_id,
+                        )
+                        skill_calls.append(_to_skill_call(invoke_result))
+                        tool_runs.append(_to_tool_run(invoke_result))
+                        payload = invoke_result.output_payload
+                        stdout = str(payload.get("stdout", ""))
+                        stderr = str(payload.get("stderr", ""))
+                        exit_code = payload.get("exitCode")
+                        if stdout.strip():
+                            sandbox_outputs.append(stdout.strip())
+                            evidence.append(f"[沙盒执行结果 exit={exit_code}]\n{stdout.strip()}")
+                        if exit_code != 0:
+                            detail = stderr.strip() or str(
+                                (payload.get("error") or {}).get("value", "")
+                            )
+                            evidence.append(f"[沙盒执行失败 exit={exit_code}]\n{detail[:1500]}")
+                    except Exception as exc:
+                        error_msg = str(exc)
+                        skill_calls.append(
+                            ToolSkillCall(
+                                skill_name="mcp.sandbox.execute",
+                                status="failed",
+                                latency_ms=0,
+                                input_summary=f"code_chars={len(code)}",
+                                output_summary="",
+                                error_message=error_msg,
+                            )
+                        )
+                        tool_runs.append(
+                            ToolRunRecord(
+                                tool_name="mcp.sandbox.execute",
+                                source="builtin",
+                                status="failed",
+                                latency_ms=0,
+                                prompt_tokens=0,
+                                completion_tokens=0,
+                                total_tokens=0,
+                                input_summary=f"code_chars={len(code)}",
+                                output_summary="",
+                                output_payload={},
+                                error_message=error_msg,
+                            )
+                        )
+
         if enable_deep_think:
             deep_result = run_deep_think_pipeline(
                 question,
@@ -235,6 +336,11 @@ class ToolOrchestrator:
                 context_lines.append(
                     f"[web-{idx}] {source.get('title', '')}\n{source.get('url', '')}\n{source.get('excerpt', '')[:1800]}"
                 )
+            rewritten_question = f"{rewritten_question}\n\n" + "\n\n".join(context_lines)
+        if sandbox_outputs:
+            context_lines = ["\n[代码沙盒执行结果]"]
+            for idx, output in enumerate(sandbox_outputs, start=1):
+                context_lines.append(f"[sandbox-{idx}]\n{output[:2000]}")
             rewritten_question = f"{rewritten_question}\n\n" + "\n\n".join(context_lines)
         if deep_think_summary:
             rewritten_question = (

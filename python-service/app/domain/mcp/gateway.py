@@ -15,6 +15,7 @@ from app.domain.mcp.registry import (
     set_external_tools_enabled_by_server,
     upsert_external_tool,
 )
+from app.domain.tools.builtin_sandbox import execute_python_code
 from app.domain.tools.builtin_web_fetch import fetch_and_extract_webpage
 
 settings = get_settings()
@@ -110,28 +111,53 @@ class McpGateway:
 
     async def _invoke_builtin(self, *, tool_name: str, args: dict[str, Any]) -> ToolInvokeResult:
         start = time.monotonic()
-        if tool_name != "mcp.web.fetch":
-            raise RuntimeError(f"暂不支持的内置工具: {tool_name}")
 
-        url = str(args.get("url", "")).strip()
-        if not url:
-            raise ValueError("url 不能为空")
+        if tool_name == "mcp.web.fetch":
+            url = str(args.get("url", "")).strip()
+            if not url:
+                raise ValueError("url 不能为空")
 
-        max_chars = int(args.get("maxChars", settings.mcp_web_max_content_chars) or settings.mcp_web_max_content_chars)
-        payload = await fetch_and_extract_webpage(
-            url,
-            timeout_sec=settings.mcp_web_request_timeout_sec,
-            max_chars=max_chars,
-        )
-        return ToolInvokeResult(
-            tool_name=tool_name,
-            source="builtin",
-            status="success",
-            latency_ms=int((time.monotonic() - start) * 1000),
-            input_summary=f"url={url}",
-            output_summary=f"title={payload.get('title', '')[:80]},chars={payload.get('capturedChars', 0)}",
-            output_payload=payload,
-        )
+            max_chars = int(args.get("maxChars", settings.mcp_web_max_content_chars) or settings.mcp_web_max_content_chars)
+            payload = await fetch_and_extract_webpage(
+                url,
+                timeout_sec=settings.mcp_web_request_timeout_sec,
+                max_chars=max_chars,
+            )
+            return ToolInvokeResult(
+                tool_name=tool_name,
+                source="builtin",
+                status="success",
+                latency_ms=int((time.monotonic() - start) * 1000),
+                input_summary=f"url={url}",
+                output_summary=f"title={payload.get('title', '')[:80]},chars={payload.get('capturedChars', 0)}",
+                output_payload=payload,
+            )
+
+        if tool_name == "mcp.sandbox.execute":
+            if not settings.sandbox_enabled:
+                raise RuntimeError("代码沙盒功能未启用（SANDBOX_ENABLED=false）")
+            code = str(args.get("code", ""))
+            timeout_sec = int(args.get("timeoutSec", 0) or 0) or None
+            payload = await execute_python_code(code, timeout_sec=timeout_sec)
+            status = "success" if payload.get("exitCode") == 0 else "failed"
+            return ToolInvokeResult(
+                tool_name=tool_name,
+                source="builtin",
+                status=status,
+                latency_ms=int((time.monotonic() - start) * 1000),
+                input_summary=f"code_chars={len(code)},timeout={payload.get('execTimeoutSec')}s",
+                output_summary=(
+                    f"exit={payload.get('exitCode')},stdout_chars={len(payload.get('stdout', ''))}"
+                ),
+                output_payload=payload,
+                error_message=(
+                    "沙盒内代码执行失败"
+                    if status == "failed"
+                    else None
+                ),
+            )
+
+        raise RuntimeError(f"暂不支持的内置工具: {tool_name}")
 
     async def _invoke_external(
         self,

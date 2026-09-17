@@ -49,6 +49,21 @@ BUILTIN_TOOLS: tuple[dict[str, Any], ...] = (
         },
     },
     {
+        "tool_name": "mcp.sandbox.execute",
+        "display_name": "代码沙盒",
+        "description": "在 OpenSandbox 隔离沙盒中执行 Python 代码并返回 stdout/stderr/退出码（默认禁网、限资源、限时长）",
+        "source": "builtin",
+        "server_key": None,
+        "tool_schema": {
+            "type": "object",
+            "required": ["code"],
+            "properties": {
+                "code": {"type": "string", "description": "要执行的 Python 代码"},
+                "timeoutSec": {"type": "integer", "description": "单次执行超时秒数"},
+            },
+        },
+    },
+    {
         "tool_name": "mcp.deep_think.pipeline",
         "display_name": "深度思考",
         "description": "plan/execute/reflect/verify 四阶段编排",

@@ -75,6 +75,16 @@ class Settings(BaseSettings):
     deep_think_enabled: bool = True
     deep_think_max_iterations: int = 3
 
+    # OpenSandbox 代码沙盒（mcp.sandbox.execute 工具）
+    sandbox_enabled: bool = True
+    open_sandbox_domain: str = "127.0.0.1:18092"
+    open_sandbox_api_key: str = "rag-demo-dev-key"
+    sandbox_image: str = "python:3.11-slim"
+    sandbox_total_timeout_sec: int = 120
+    sandbox_exec_timeout_sec: int = 30
+    sandbox_max_output_chars: int = 8000
+    sandbox_max_code_chars: int = 20000
+
     # 文档 Worker 配置
     document_worker_enabled: bool = True
     document_worker_prefetch: int = 2

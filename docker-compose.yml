@@ -1,5 +1,38 @@
 name: rag_demo_infra
 
+configs:
+  opensandbox-config:
+    content: |
+      [server]
+      host = "0.0.0.0"
+      port = 8090
+      # 本地开发密钥（生产环境务必替换并走安全注入）
+      api_key = "${OPENSANDBOX_API_KEY:-rag-demo-dev-key}"
+
+      [log]
+      level = "INFO"
+
+      [runtime]
+      type = "docker"
+      execd_image = "sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/execd:v1.1.0"
+
+      [egress]
+      image = "sandbox-registry.cn-zhangjiakou.cr.aliyuncs.com/opensandbox/egress:v1.1.7"
+      readiness_timeout_seconds = 30.0
+
+      [docker]
+      network_mode = "bridge"
+      # server 跑在容器里、沙盒端口发布在宿主 docker daemon 上；SDK 走 server 代理访问沙盒
+      host_ip = "host.docker.internal"
+      port_range_min = 40000
+      port_range_max = 60000
+      drop_capabilities = ["AUDIT_WRITE", "MKNOD", "NET_ADMIN", "NET_RAW", "SYS_ADMIN", "SYS_MODULE", "SYS_PTRACE", "SYS_TIME", "SYS_TTY_CONFIG"]
+      no_new_privileges = true
+      pids_limit = 4096
+
+      [ingress]
+      mode = "direct"
+
 services:
   postgres:
     image: pgvector/pgvector:pg16
@@ -56,6 +89,24 @@ services:
       interval: 10s
       timeout: 5s
       retries: 10
+    networks:
+      - rag_demo_net
+
+  # OpenSandbox Server：AI 代码沙盒（mcp.sandbox.execute 工具的执行底座）
+  # 宿主端口 18090（容器内 8090），挂载 docker.sock 以创建沙盒容器
+  opensandbox-server:
+    image: opensandbox/server:latest
+    container_name: rag_demo_opensandbox
+    restart: unless-stopped
+    ports:
+      - "${OPENSANDBOX_PORT:-18090}:8090"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    configs:
+      - source: opensandbox-config
+        target: /etc/opensandbox/config.toml
+    environment:
+      - SANDBOX_CONFIG_PATH=/etc/opensandbox/config.toml
     networks:
       - rag_demo_net
 
