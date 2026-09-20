@@ -56,6 +56,7 @@ export interface AskRequest {
   enableTools?: boolean;
   enableDeepThink?: boolean;
   maxToolSteps?: number;
+  externalTools?: string[]; // 显式点名的 MCP 工具，回答前调用并注入结果
 }
 
 export interface ToolRunItem {

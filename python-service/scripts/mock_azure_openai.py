@@ -164,7 +164,11 @@ async def chat_completions(
         )
 
     answer = (
-        f"【模拟回答】关于「{user_question}」的要点：知识库检索命中相关上下文，综合整理如下 [1]。{history_note}"
+        f"【模拟回答】关于「{user_question}」的要点：\n\n"
+        f"1. 知识库检索命中相关上下文，综合整理如下 [1]\n"
+        f"2. 支持多轮对话与答案缓存\n\n"
+        f"```python\nresult = sum(range(1, 101))\nprint('1..100 =', result)\n```\n"
+        f"{history_note}"
     )
 
     prompt_tokens = sum(len(str(m.get("content", ""))) for m in messages)

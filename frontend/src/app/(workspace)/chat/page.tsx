@@ -28,15 +28,17 @@ import {
 } from "antd";
 import { useEffect, useMemo, useRef, useState } from "react";
 
+import MarkdownAnswer from "@/components/markdown-answer";
 import {
   askQuestionStream,
   deleteChatSession,
   fetchChatSessions,
   fetchDocuments,
   fetchModels,
+  fetchMcpTools,
   fetchSessionMessages,
 } from "@/lib/rag-api";
-import { ChatSession, DocumentItem, ModelItem, ToolRunItem } from "@/types/rag";
+import { ChatSession, DocumentItem, McpToolItem, ModelItem, ToolRunItem } from "@/types/rag";
 
 interface ChatTurn {
   id: string;
@@ -97,6 +99,9 @@ export default function ChatPage() {
   const [showHistory, setShowHistory] = useState(false);
   const [enableTools, setEnableTools] = useState(true);
   const [enableDeepThink, setEnableDeepThink] = useState(false);
+  const [mcpTools, setMcpTools] = useState<McpToolItem[]>([]);
+  const [loadingTools, setLoadingTools] = useState(false);
+  const [selectedToolNames, setSelectedToolNames] = useState<string[]>([]);
   const [apiMessage, contextHolder] = message.useMessage();
   const threadRef = useRef<HTMLDivElement>(null);
   const initialRestoreDone = useRef(false);
@@ -143,6 +148,23 @@ export default function ChatPage() {
         console.error("加载文档列表失败:", error);
       } finally {
         setLoadingDocs(false);
+      }
+    };
+
+    void run();
+  }, []);
+
+  // 加载 MCP 工具（供聊天点名调用）
+  useEffect(() => {
+    const run = async () => {
+      setLoadingTools(true);
+      try {
+        const data = await fetchMcpTools();
+        setMcpTools(data.filter((tool) => tool.enabled));
+      } catch (error) {
+        console.error("加载 MCP 工具失败:", error);
+      } finally {
+        setLoadingTools(false);
       }
     };
 
@@ -282,6 +304,7 @@ export default function ChatPage() {
           documentIds: useRag ? selectedDocIds : undefined,
           enableTools,
           enableDeepThink,
+          externalTools: enableTools && selectedToolNames.length > 0 ? selectedToolNames : undefined,
         },
         {
           onChunk: (text) => {
@@ -490,7 +513,18 @@ export default function ChatPage() {
                       </span>
                     </div>
                     <div className="chat-bubble__content">
-                      {turn.content || (turn.role === "assistant" && asking ? "思考中..." : "")}
+                      {turn.role === "assistant" ? (
+                        <MarkdownAnswer
+                          content={turn.content}
+                          referenceCount={turn.references?.length ?? 0}
+                          streaming={asking && turn.id === chatTurns[chatTurns.length - 1]?.id}
+                        />
+                      ) : (
+                        turn.content
+                      )}
+                      {turn.role === "assistant" && asking && !turn.content && turn.id === chatTurns[chatTurns.length - 1]?.id
+                        ? "思考中..."
+                        : ""}
                     </div>
                     {turn.deepThinkSummary ? (
                       <div className="chat-bubble__refs">
@@ -517,8 +551,8 @@ export default function ChatPage() {
                         <FileTextOutlined />
                         <span className="chat-bubble__refs-label">引用来源：</span>
                         {turn.references.map((ref, refIndex) => (
-                          <Tag key={refIndex} className="chat-ref-tag">
-                            {ref.documentName} · {(ref.score * 100).toFixed(0)}%
+                          <Tag key={refIndex} id={`chat-ref-${refIndex + 1}`} className="chat-ref-badge">
+                            [{refIndex + 1}] {ref.documentName} · {(ref.score * 100).toFixed(0)}%
                           </Tag>
                         ))}
                       </div>
@@ -681,6 +715,39 @@ export default function ChatPage() {
                       ))}
                     </div>
                   </div>
+                )}
+              </>
+            )}
+          </div>
+          <div className="chat-drawer__section">
+            <div className="chat-drawer__section-title">MCP 工具</div>
+            {loadingTools ? (
+              <div className="chat-drawer__loading">
+                <Spin size="small" />
+              </div>
+            ) : mcpTools.length === 0 ? (
+              <Empty description="暂无已启用的 MCP 工具" image={Empty.PRESENTED_IMAGE_SIMPLE} />
+            ) : (
+              <>
+                <Select
+                  mode="multiple"
+                  placeholder="点名调用的工具（默认自动路由）"
+                  value={selectedToolNames}
+                  onChange={setSelectedToolNames}
+                  style={{ width: "100%" }}
+                  maxTagCount={3}
+                  options={mcpTools.map((tool) => ({
+                    value: tool.toolName,
+                    label: `${tool.displayName}（${tool.source === "external" ? "外部" : "内置"}）`,
+                  }))}
+                />
+                {selectedToolNames.length > 0 && (
+                  <Typography.Text
+                    type="secondary"
+                    style={{ fontSize: 12, display: "block", marginTop: 6 }}
+                  >
+                    发送时会先调用这些工具，输出将作为回答上下文。
+                  </Typography.Text>
                 )}
               </>
             )}

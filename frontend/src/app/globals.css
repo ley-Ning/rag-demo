@@ -2472,3 +2472,178 @@ body::before {
   background: linear-gradient(135deg, rgba(0, 113, 227, 0.05) 0%, rgba(0, 113, 227, 0.1) 100%);
   border-color: rgba(0, 113, 227, 0.2);
 }
+
+/* ============== Markdown 回答渲染 ============== */
+
+.md-answer {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font-size: 14px;
+  line-height: 1.7;
+}
+
+.md-answer p {
+  margin: 0;
+}
+
+.md-answer h1,
+.md-answer h2,
+.md-answer h3,
+.md-answer h4 {
+  margin: 4px 0 0;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.md-answer ul,
+.md-answer ol {
+  margin: 0;
+  padding-left: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.md-answer blockquote {
+  margin: 0;
+  padding: 6px 12px;
+  border-left: 3px solid var(--rag-accent);
+  background: rgba(0, 113, 227, 0.05);
+  border-radius: 4px;
+  color: var(--rag-text-secondary);
+}
+
+.md-answer table {
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.md-answer th,
+.md-answer td {
+  border: 1px solid rgba(0, 0, 0, 0.1);
+  padding: 4px 10px;
+}
+
+.md-answer th {
+  background: rgba(0, 0, 0, 0.03);
+  font-weight: 600;
+}
+
+/* 引用角标 */
+.md-answer__citation {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 16px;
+  height: 16px;
+  margin: 0 2px;
+  padding: 0 4px;
+  font-size: 11px;
+  line-height: 1;
+  vertical-align: super;
+  background: rgba(0, 113, 227, 0.1);
+  color: var(--rag-accent);
+  border: 1px solid rgba(0, 113, 227, 0.25);
+  border-radius: 999px;
+  text-decoration: none;
+  transition: all 0.15s ease;
+}
+
+.md-answer__citation:hover {
+  background: var(--rag-accent);
+  color: white;
+}
+
+.md-answer__citation sup {
+  font-size: 11px;
+  line-height: 1;
+}
+
+/* 行内代码 */
+.md-answer__inline-code {
+  padding: 1px 6px;
+  background: rgba(0, 0, 0, 0.06);
+  border-radius: 4px;
+  font-size: 13px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+/* 代码块 */
+.md-answer__code {
+  border: 1px solid rgba(0, 0, 0, 0.08);
+  border-radius: 8px;
+  overflow: hidden;
+  background: #1e1e2e;
+}
+
+.md-answer__code-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 4px 8px 4px 12px;
+  background: rgba(255, 255, 255, 0.05);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.md-answer__code-lang {
+  font-size: 11px;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+  color: rgba(255, 255, 255, 0.55);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.md-answer__code-header .ant-btn {
+  color: rgba(255, 255, 255, 0.65);
+}
+
+.md-answer__code-body {
+  margin: 0;
+  padding: 12px;
+  overflow-x: auto;
+  color: #cdd6f4;
+  font-size: 13px;
+  line-height: 1.6;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.md-answer__code-body code {
+  background: transparent;
+  padding: 0;
+  color: inherit;
+  font-family: inherit;
+}
+
+/* 流式打字光标 */
+.md-answer__cursor {
+  display: inline-block;
+  width: 8px;
+  height: 16px;
+  margin-left: 2px;
+  vertical-align: text-bottom;
+  background: var(--rag-accent);
+  border-radius: 2px;
+  animation: md-answer-blink 0.9s steps(1) infinite;
+}
+
+@keyframes md-answer-blink {
+  0%,
+  55% {
+    opacity: 1;
+  }
+  56%,
+  100% {
+    opacity: 0;
+  }
+}
+
+/* 引用来源角标目标锚点 */
+.chat-ref-badge {
+  scroll-margin-top: 80px;
+}
+
+/* Markdown 渲染时关闭 assistant 气泡的 pre-wrap（避免与块级元素叠加空行） */
+.chat-bubble--assistant .chat-bubble__content {
+  white-space: normal;
+}
