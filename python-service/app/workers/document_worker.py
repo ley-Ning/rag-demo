@@ -22,6 +22,7 @@ from app.core.config import get_settings
 from app.core.database import db_conn_context
 from app.core.rabbitmq import declare_documents_topology
 from app.core.redis_client import get_redis_client
+from app.domain.document_extract import extract_text
 from app.domain.embedding import get_embedding_service
 from app.domain.models_registry import _registry
 from app.domain.vector_store import get_vector_store
@@ -327,16 +328,7 @@ class DocumentWorker:
             raise RuntimeError(f"上传文件不存在: {file_path}")
 
         ext = file_path.suffix.lower() or Path(file_name).suffix.lower()
-        if ext not in {".txt", ".md", ".markdown", ".text", ".log", ".csv", ".json"}:
-            raise RuntimeError(f"暂不支持的文件类型: {ext or 'unknown'}，当前仅支持 txt/md/csv/json")
-
-        raw = file_path.read_bytes()
-        for encoding in ("utf-8", "utf-8-sig", "gb18030"):
-            try:
-                return raw.decode(encoding)
-            except Exception:
-                continue
-        raise RuntimeError("文件解码失败，请确保是 UTF-8 或 GB18030 文本文件")
+        return extract_text(file_path, ext)
 
     async def _set_task_cache(
         self,

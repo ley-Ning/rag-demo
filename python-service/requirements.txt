@@ -10,3 +10,5 @@ redis>=5.0.8
 aio-pika>=9.5.0
 opensandbox>=0.1.16
 mcp>=2.2.0
+pypdf>=4.0.0
+python-docx>=1.1.0

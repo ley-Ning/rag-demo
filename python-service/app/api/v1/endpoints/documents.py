@@ -19,6 +19,7 @@ from app.core.rabbitmq import get_rabbitmq_client
 from app.core.redis_client import get_redis_client
 from app.core.response import success
 from app.domain.answer_cache import get_answer_cache_service
+from app.domain.document_extract import SUPPORTED_EXTRACT_EXTENSIONS
 
 router = APIRouter(prefix="/documents", tags=["documents"])
 settings = get_settings()
@@ -589,6 +590,16 @@ async def upload_document(
         file.file.seek(0)
     except Exception:
         file_size = 0
+
+    upload_ext = FsPath(_sanitize_file_name(file_name)).suffix.lower()
+    if upload_ext and upload_ext not in SUPPORTED_EXTRACT_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"暂不支持的文件类型: {upload_ext}，"
+                f"当前支持 {'/'.join(sorted(SUPPORTED_EXTRACT_EXTENSIONS))}"
+            ),
+        )
 
     storage_path = ""
     try:

@@ -521,7 +521,11 @@ export default function DocumentsPage() {
             </Form.Item>
           </Form>
 
-          <Upload.Dragger {...uploadProps} disabled={uploading}>
+          <Upload.Dragger
+            {...uploadProps}
+            disabled={uploading}
+            accept=".txt,.md,.markdown,.log,.csv,.json,.pdf,.docx,.html,.htm"
+          >
                           <p className="ant-upload-drag-icon">
                             <InboxOutlined />
                           </p>
@@ -529,7 +533,7 @@ export default function DocumentsPage() {
                             点击或拖拽文件到此区域
                           </p>
                           <p className="ant-upload-hint" style={{ color: "var(--rag-text-muted)" }}>
-                            支持 PDF、Word、TXT、Markdown 等格式
+                            支持 PDF、Word(docx)、HTML、TXT、Markdown、CSV、JSON（扫描件 PDF 请先 OCR）
                           </p>
                         </Upload.Dragger>
 
