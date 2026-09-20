@@ -49,6 +49,11 @@ class Settings(BaseSettings):
     rag_parent_child_expand_window: int = 1
     vector_dimension: int = 1536
 
+    # 交叉重排（rerank 模型在线且配置 baseUrl 时生效；失败降级为向量序）
+    rag_cross_rerank_enabled: bool = True
+    rag_rerank_candidate_multiplier: int = 4
+    rag_rerank_timeout_sec: int = 10
+
     # 问答答案缓存（Redis 精确命中 + pgvector 语义命中）
     rag_answer_cache_enabled: bool = True
     rag_answer_cache_ttl_sec: int = 3600

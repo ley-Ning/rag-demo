@@ -60,6 +60,31 @@ async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.post("/rerank")
+async def rerank(body: dict[str, Any]) -> dict[str, Any]:
+    """Cohere/Jina 风格 rerank：确定性词重叠打分（拉丁词 + CJK 单字重叠率）"""
+    query = str(body.get("query", ""))
+    documents = body.get("documents") or []
+    query_tokens = set(LATIN_RE.findall(query.lower())) | set(CJK_RE.findall(query))
+
+    scored: list[tuple[int, float]] = []
+    for index, document in enumerate(documents):
+        doc_tokens = set(LATIN_RE.findall(str(document).lower())) | set(CJK_RE.findall(str(document)))
+        overlap = len(query_tokens & doc_tokens) / max(len(query_tokens), 1)
+        scored.append((index, round(overlap, 4)))
+    scored.sort(key=lambda pair: pair[1], reverse=True)
+
+    top_n = body.get("top_n")
+    if isinstance(top_n, int) and top_n > 0:
+        scored = scored[:top_n]
+    return {
+        "model": body.get("model", "mock-reranker"),
+        "results": [
+            {"index": index, "relevance_score": score} for index, score in scored
+        ],
+    }
+
+
 @app.post("/openai/deployments/{deployment}/embeddings")
 async def embeddings(deployment: str, body: dict[str, Any]) -> dict[str, Any]:
     inputs = body.get("input") or []

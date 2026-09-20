@@ -11,6 +11,7 @@ from app.core.config import get_settings
 from app.domain.answer_cache import CachedAnswer, get_answer_cache_service
 from app.domain.embedding import EmbeddingUsage, get_embedding_service
 from app.domain.models_registry import ModelInfo, ModelRegistry
+from app.domain.reranker import get_reranker_service
 from app.domain.vector_store import SearchResult, get_vector_store
 
 logger = logging.getLogger(__name__)
@@ -316,12 +317,23 @@ class RAGService:
                 )
 
         # 2) MCP skill: vector search
+        # 交叉重排启用时先多召回候选，重排后截断回 top_k
+        rerank_model = None
+        if self._settings.rag_cross_rerank_enabled:
+            rerank_model = get_reranker_service().resolve_model(registry)
+        search_top_k = self._settings.rag_top_k
+        if rerank_model is not None:
+            search_top_k = min(
+                self._settings.rag_top_k * max(1, self._settings.rag_rerank_candidate_multiplier),
+                50,
+            )
+
         search_start = time.monotonic()
         try:
             search_results = await vector_store.similarity_search(
                 conn,
                 query_embedding,
-                top_k=self._settings.rag_top_k,
+                top_k=search_top_k,
                 min_score=self._settings.rag_min_score,
                 document_ids=document_ids,
                 use_parent_child_rerank=self._settings.rag_parent_child_rerank,
@@ -331,14 +343,18 @@ class RAGService:
             search_latency_ms = int((time.monotonic() - search_start) * 1000)
             doc_filter_summary = f",docs={len(document_ids)}" if document_ids else ""
             mode_summary = ",mode=parent-child" if self._settings.rag_parent_child_rerank else ",mode=flat"
+            rerank_summary = (
+                f",rerank_candidates={search_top_k}" if rerank_model is not None else ""
+            )
             skill_calls.append(
                 SkillCallLog(
                     skill_name="mcp.vector.search",
                     status="success",
                     latency_ms=search_latency_ms,
                     input_summary=(
-                        f"top_k={self._settings.rag_top_k},min_score={self._settings.rag_min_score}"
-                        f"{doc_filter_summary}{mode_summary}"
+                        f"top_k={search_top_k},final={self._settings.rag_top_k}"
+                        f",min_score={self._settings.rag_min_score}"
+                        f"{doc_filter_summary}{mode_summary}{rerank_summary}"
                     ),
                     output_summary=f"hits={len(search_results)}",
                 )
@@ -369,6 +385,56 @@ class RAGService:
                 total_tokens,
                 skill_calls,
             ) from exc
+
+        # 2.5) MCP skill: cross rerank（交叉重排；失败降级为向量序截断）
+        if rerank_model is not None and len(search_results) > 1:
+            rerank_start = time.monotonic()
+            vector_order = [result.chunk_id for result in search_results]
+            try:
+                ranked = await get_reranker_service().rerank(
+                    retrieval_question,
+                    [result.content for result in search_results],
+                    top_n=self._settings.rag_top_k,
+                    model=rerank_model,
+                )
+                reranked_results = [search_results[index] for index, _score in ranked]
+                # 重排结果不足 top_k 时用剩余候选按向量序补齐
+                if len(reranked_results) < self._settings.rag_top_k:
+                    used = {index for index, _score in ranked}
+                    leftovers = [result for idx, result in enumerate(search_results) if idx not in used]
+                    reranked_results.extend(leftovers)
+                search_results = reranked_results[: self._settings.rag_top_k]
+                new_order = [result.chunk_id for result in search_results]
+                order_changed = new_order != vector_order[: len(new_order)]
+                skill_calls.append(
+                    SkillCallLog(
+                        skill_name="mcp.rerank.rank",
+                        status="success",
+                        latency_ms=int((time.monotonic() - rerank_start) * 1000),
+                        input_summary=(
+                            f"candidates={len(vector_order)},model={rerank_model.model_id},"
+                            f"top_k={self._settings.rag_top_k}"
+                        ),
+                        output_summary=(
+                            f"final={len(search_results)},order_changed={order_changed},"
+                            f"top1={str(ranked[0][1])[:6] if ranked else 'n/a'}"
+                        ),
+                    )
+                )
+            except Exception as exc:
+                search_results = search_results[: self._settings.rag_top_k]
+                skill_calls.append(
+                    SkillCallLog(
+                        skill_name="mcp.rerank.rank",
+                        status="failed",
+                        latency_ms=int((time.monotonic() - rerank_start) * 1000),
+                        input_summary=f"candidates={len(vector_order)},model={rerank_model.model_id}",
+                        output_summary="",
+                        error_message=f"重排失败已降级向量序: {str(exc)[:200]}",
+                    )
+                )
+        else:
+            search_results = search_results[: self._settings.rag_top_k]
 
         # 3) 构建上下文
         context = self._build_context(search_results)
