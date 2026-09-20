@@ -139,6 +139,36 @@ async def chat_completions(
             "usage": token_usage(prompt_tokens, len(rewrite_answer)),
         }
 
+    # 长期记忆蒸馏请求：从 user 消息中提取"事实"（确定性，便于验证管线）
+    if "长期记忆" in system_content and "提取" in system_content:
+        import json as _json
+
+        # 蒸馏请求的 user 消息格式：【用户提问】\n{q}\n\n【助手回答】\n{a}
+        source = user_question.split("【助手回答】", 1)[0]
+        source = source.replace("【用户提问】", "").strip()
+        distill_answer = _json.dumps([f"用户提到：{source[:40]}"], ensure_ascii=False)
+        prompt_tokens = sum(len(str(m.get("content", ""))) for m in messages)
+        return {
+            "id": "mock-chatcmpl-distill",
+            "object": "chat.completion",
+            "model": deployment,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": distill_answer},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": token_usage(prompt_tokens, len(distill_answer)),
+        }
+
+    # 回显分层记忆注入情况（system prompt 中的记忆块），验证注入确实送达模型
+    memory_note = ""
+    global_count = system_content.count("[全局记忆]")
+    user_memory_count = system_content.count("[用户长期记忆]")
+    if global_count or user_memory_count:
+        memory_note = f"（记忆注入：全局{global_count}块/用户{user_memory_count}块）"
+
     # 回显对话历史摘要，验证多轮记忆确实送达模型
     history_messages = [m for m in messages if m.get("role") in ("user", "assistant")][:-1]
     history_note = ""
@@ -168,7 +198,7 @@ async def chat_completions(
         f"1. 知识库检索命中相关上下文，综合整理如下 [1]\n"
         f"2. 支持多轮对话与答案缓存\n\n"
         f"```python\nresult = sum(range(1, 101))\nprint('1..100 =', result)\n```\n"
-        f"{history_note}"
+        f"{memory_note}{history_note}"
     )
 
     prompt_tokens = sum(len(str(m.get("content", ""))) for m in messages)

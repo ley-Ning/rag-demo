@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import time
@@ -12,6 +13,7 @@ from app.core.config import get_settings
 from app.core.database import db_conn_context, get_db_conn, get_optional_db_conn
 from app.core.response import success
 from app.domain.models_registry import _registry, model_supports
+from app.domain.memory import get_memory_service
 from app.domain.rag_service import RAGExecutionError, SkillCallLog, get_rag_service
 from app.domain.tools.orchestrator import DeepThinkRunRecord, ToolRunRecord, get_tool_orchestrator
 
@@ -32,6 +34,8 @@ class AskRequest(BaseModel):
     maxToolSteps: int | None = Field(default=None, ge=1, le=12)
     # 显式点名的 MCP 工具（内置/外部皆可）：回答前先调用，输出注入上下文
     externalTools: list[str] | None = Field(default=None, max_length=5)
+    # 用户标识（分层记忆的用户长期记忆命名空间，默认 default）
+    userKey: str | None = Field(default=None, max_length=64)
 
 
 # ============== 聊天历史存储函数 ==============
@@ -395,6 +399,34 @@ async def _write_deep_think_runs(
         logger.exception("Failed to write deep_think_runs, trace_id=%s", trace_id)
 
 
+def _schedule_memory_distillation(
+    *,
+    question: str,
+    answer: str,
+    user_key: str,
+    model_id: str,
+) -> None:
+    """对话后异步蒸馏用户长期记忆（fire-and-forget，任何失败只记日志）"""
+
+    async def _run() -> None:
+        try:
+            await get_memory_service().distill_from_exchange(
+                question,
+                answer,
+                user_key=user_key,
+                model_id=model_id,
+                registry=_registry,
+            )
+        except Exception:
+            logger.exception("Memory distillation task failed (ignored)")
+
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(_run(), name="memory-distill")
+    except RuntimeError:
+        pass
+
+
 def _sse_event(event: str, data: dict[str, object]) -> str:
     payload = json.dumps(data, ensure_ascii=False)
     return f"event: {event}\ndata: {payload}\n\n"
@@ -452,6 +484,13 @@ async def ask_question(
     if payload.sessionId and conn is not None:
         history = await _load_chat_history(conn, payload.sessionId)
 
+    # 分层记忆：全局 + 用户长期记忆注入 system prompt
+    user_key = (payload.userKey or "default").strip() or "default"
+    memory_block = ""
+    if conn is not None and settings.layered_memory_enabled:
+        memory_entries = await get_memory_service().load_context_entries(conn, user_key)
+        memory_block = get_memory_service().build_context_block(memory_entries)
+
     rewritten_question = payload.question
     orchestration_skill_calls: list[SkillCallLog] = []
     tool_runs: list[ToolRunRecord] = []
@@ -503,6 +542,7 @@ async def ask_question(
                 session_id=session_id,
                 document_ids=payload.documentIds,
                 history=history,
+                memory_block=memory_block,
             )
         else:
             result = await rag_service.chat_only(
@@ -511,6 +551,7 @@ async def ask_question(
                 registry=_registry,
                 session_id=session_id,
                 history=history,
+                memory_block=memory_block,
             )
         merged_skill_calls = [*orchestration_skill_calls, *result.skill_calls]
 
@@ -525,6 +566,13 @@ async def ask_question(
                 "assistant",
                 result.answer,
                 result.references,
+            )
+            # 用户长期记忆蒸馏（异步 best-effort，不阻塞响应）
+            _schedule_memory_distillation(
+                question=payload.question,
+                answer=result.answer,
+                user_key=user_key,
+                model_id=payload.modelId,
             )
 
         latency_ms = int((time.monotonic() - start_time) * 1000)
@@ -784,10 +832,18 @@ async def ask_question_stream(
                     )
 
                 history: list[dict[str, str]] = []
+                stream_memory_block = ""
                 try:
                     async with db_conn_context() as rag_conn:
                         if payload.sessionId:
                             history = await _load_chat_history(rag_conn, payload.sessionId)
+                        if settings.layered_memory_enabled:
+                            memory_entries = await get_memory_service().load_context_entries(
+                                rag_conn, (payload.userKey or "default").strip() or "default"
+                            )
+                            stream_memory_block = get_memory_service().build_context_block(
+                                memory_entries
+                            )
                         if settings.mcp_enabled and (enable_tools or enable_deep_think):
                             orchestrator = get_tool_orchestrator()
                             orchestration = await orchestrator.orchestrate(
@@ -829,6 +885,7 @@ async def ask_question_stream(
                             session_id=session_id,
                             document_ids=payload.documentIds,
                             history=history,
+                            memory_block=stream_memory_block,
                         )
                         model_id = result.model_id
                         skill_calls = [*orchestration_skill_calls, *result.skill_calls]
@@ -843,6 +900,12 @@ async def ask_question_stream(
                             "assistant",
                             full_answer,
                             references,
+                        )
+                        _schedule_memory_distillation(
+                            question=payload.question,
+                            answer=full_answer,
+                            user_key=(payload.userKey or "default").strip() or "default",
+                            model_id=payload.modelId,
                         )
                         await persist_observability_logs(
                             rag_conn,
@@ -884,6 +947,7 @@ async def ask_question_stream(
                 )
             else:
                 chat_history: list[dict[str, str]] = []
+                chat_memory_block = ""
                 if payload.sessionId:
                     try:
                         async with db_conn_context() as history_conn:
@@ -893,6 +957,21 @@ async def ask_question_stream(
                     except Exception as exc:
                         logger.warning(
                             "[%s] Chat history load skipped in stream chat-only: %s",
+                            trace_id,
+                            exc,
+                        )
+                if settings.layered_memory_enabled:
+                    try:
+                        async with db_conn_context() as memory_conn:
+                            memory_entries = await get_memory_service().load_context_entries(
+                                memory_conn, (payload.userKey or "default").strip() or "default"
+                            )
+                            chat_memory_block = get_memory_service().build_context_block(
+                                memory_entries
+                            )
+                    except Exception as exc:
+                        logger.warning(
+                            "[%s] Memory load skipped in stream chat-only: %s",
                             trace_id,
                             exc,
                         )
@@ -943,6 +1022,7 @@ async def ask_question_stream(
                     registry=_registry,
                     usage_sink=usage_stats,
                     history=chat_history,
+                    memory_block=chat_memory_block,
                 ):
                     full_answer += piece
                     yield _sse_event("chunk", {"text": piece})

@@ -297,3 +297,15 @@ export interface ChatSessionsResult {
   items: ChatSession[];
   total: number;
 }
+
+export interface MemoryEntryItem {
+  id: number;
+  scope: "global" | "user";
+  scopeKey: string;
+  content: string;
+  source: "manual" | "distilled";
+  importance: number;
+  enabled: boolean;
+  createdAt: string;
+  updatedAt: string;
+}

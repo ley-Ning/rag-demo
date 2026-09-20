@@ -67,6 +67,13 @@ class Settings(BaseSettings):
     # 有历史时先把追问改写成独立问题再做检索（改写失败自动退回原问题）
     chat_question_rewrite_enabled: bool = True
 
+    # 分层记忆：全局（共享）+ 用户长期（跨会话蒸馏）
+    layered_memory_enabled: bool = True
+    memory_max_context_entries: int = 20
+    memory_distill_enabled: bool = True
+    memory_distill_min_answer_chars: int = 50
+    memory_max_entries_per_scope: int = 200
+
     # MCP / Tool Orchestration 配置
     mcp_enabled: bool = True
     mcp_auto_call: bool = True

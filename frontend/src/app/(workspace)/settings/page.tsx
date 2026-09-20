@@ -9,6 +9,10 @@ import {
   Divider,
   Form,
   Input,
+  InputNumber,
+  Popconfirm,
+  Select,
+  Space,
   Switch,
   Table,
   Tag,
@@ -18,20 +22,29 @@ import {
 import type { ColumnsType } from "antd/es/table";
 
 import {
+  createMemoryEntry,
   createMcpServer,
+  deleteMemoryEntry,
+  fetchMemoryEntries,
   fetchMcpServers,
   fetchMcpTools,
   syncMcpServerTools,
   updateMcpServer,
+  updateMemoryEntry,
   updateMcpToolStatus,
 } from "@/lib/rag-api";
-import { McpServerItem, McpToolItem } from "@/types/rag";
+import { McpServerItem, McpToolItem, MemoryEntryItem } from "@/types/rag";
 
 const { Title, Paragraph, Text } = Typography;
 
 export default function SettingsPage() {
   const [servers, setServers] = useState<McpServerItem[]>([]);
   const [tools, setTools] = useState<McpToolItem[]>([]);
+  const [memories, setMemories] = useState<MemoryEntryItem[]>([]);
+  const [memoryScope, setMemoryScope] = useState<"global" | "user">("global");
+  const [memoryContent, setMemoryContent] = useState("");
+  const [memoryImportance, setMemoryImportance] = useState(3);
+  const [addingMemory, setAddingMemory] = useState(false);
   const [loading, setLoading] = useState(true);
   const [creating, setCreating] = useState(false);
   const [syncingServerKey, setSyncingServerKey] = useState<string | null>(null);
@@ -41,13 +54,62 @@ export default function SettingsPage() {
   const loadAll = async () => {
     setLoading(true);
     try {
-      const [serverItems, toolItems] = await Promise.all([fetchMcpServers(), fetchMcpTools()]);
+      const [serverItems, toolItems, memoryItems] = await Promise.all([
+        fetchMcpServers(),
+        fetchMcpTools(),
+        fetchMemoryEntries(),
+      ]);
       setServers(serverItems);
       setTools(toolItems);
+      setMemories(memoryItems);
     } catch (error) {
       apiMessage.error((error as Error).message || "加载 MCP 配置失败");
     } finally {
       setLoading(false);
+    }
+  };
+
+  const handleAddMemory = async () => {
+    const content = memoryContent.trim();
+    if (!content) {
+      apiMessage.warning("请输入记忆内容");
+      return;
+    }
+    setAddingMemory(true);
+    try {
+      await createMemoryEntry({
+        scope: memoryScope,
+        content,
+        importance: memoryImportance,
+      });
+      setMemoryContent("");
+      apiMessage.success("记忆已添加，后续对话立即生效");
+      await loadAll();
+    } catch (error) {
+      apiMessage.error((error as Error).message || "添加失败");
+    } finally {
+      setAddingMemory(false);
+    }
+  };
+
+  const handleToggleMemory = async (entry: MemoryEntryItem, enabled: boolean) => {
+    try {
+      await updateMemoryEntry(entry.id, { enabled });
+      setMemories((prev) =>
+        prev.map((item) => (item.id === entry.id ? { ...item, enabled } : item)),
+      );
+    } catch (error) {
+      apiMessage.error((error as Error).message || "操作失败");
+    }
+  };
+
+  const handleDeleteMemory = async (entry: MemoryEntryItem) => {
+    try {
+      await deleteMemoryEntry(entry.id);
+      setMemories((prev) => prev.filter((item) => item.id !== entry.id));
+      apiMessage.success("记忆已删除");
+    } catch (error) {
+      apiMessage.error((error as Error).message || "删除失败");
     }
   };
 
@@ -302,6 +364,95 @@ export default function SettingsPage() {
           loading={loading}
           pagination={false}
           size="small"
+        />
+      </Card>
+
+      <Card className="panel-card">
+        <Title level={5} className="panel-title">分层记忆管理</Title>
+        <Divider style={{ margin: "12px 0 16px" }} />
+        <Paragraph type="secondary">
+          全局记忆对所有对话生效（规则/口径/常识）；用户长期记忆跨会话生效（对话后自动蒸馏，也可手动添加）。回答时自动注入。
+        </Paragraph>
+        <Space.Compact style={{ width: "100%", marginBottom: 12 }}>
+          <Select
+            value={memoryScope}
+            onChange={setMemoryScope}
+            style={{ width: 130 }}
+            options={[
+              { value: "global", label: "全局记忆" },
+              { value: "user", label: "用户长期" },
+            ]}
+          />
+          <Input
+            placeholder="输入记忆内容（一句话，如：回答统一使用中文）"
+            value={memoryContent}
+            onChange={(event) => setMemoryContent(event.target.value)}
+            onPressEnter={() => void handleAddMemory()}
+            maxLength={200}
+          />
+          <InputNumber
+            min={1}
+            max={5}
+            value={memoryImportance}
+            onChange={(value) => setMemoryImportance(value ?? 3)}
+            style={{ width: 90 }}
+            addonAfter="级"
+          />
+          <Button type="primary" loading={addingMemory} onClick={() => void handleAddMemory()}>
+            添加
+          </Button>
+        </Space.Compact>
+        <Table
+          rowKey="id"
+          size="small"
+          loading={loading}
+          pagination={false}
+          dataSource={memories}
+          columns={[
+            {
+              title: "范围",
+              dataIndex: "scope",
+              width: 90,
+              render: (value: string) =>
+                value === "global" ? (
+                  <Tag color="purple">全局</Tag>
+                ) : (
+                  <Tag color="blue">用户</Tag>
+                ),
+            },
+            { title: "内容", dataIndex: "content" },
+            {
+              title: "来源",
+              dataIndex: "source",
+              width: 90,
+              render: (value: string) =>
+                value === "distilled" ? <Tag>自动蒸馏</Tag> : <Tag>手动</Tag>,
+            },
+            { title: "重要度", dataIndex: "importance", width: 80 },
+            {
+              title: "启用",
+              dataIndex: "enabled",
+              width: 80,
+              render: (_: unknown, record: MemoryEntryItem) => (
+                <Switch
+                  size="small"
+                  checked={record.enabled}
+                  onChange={(checked) => void handleToggleMemory(record, checked)}
+                />
+              ),
+            },
+            {
+              title: "操作",
+              width: 80,
+              render: (_: unknown, record: MemoryEntryItem) => (
+                <Popconfirm title="删除该记忆？" onConfirm={() => void handleDeleteMemory(record)}>
+                  <Button type="link" size="small" danger>
+                    删除
+                  </Button>
+                </Popconfirm>
+              ),
+            },
+          ]}
         />
       </Card>
 

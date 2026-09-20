@@ -71,6 +71,7 @@ class AnswerCacheService:
         embedding_model_id: str,
         document_ids: list[str] | None,
         kb_version: int,
+        memory_version: int = 0,
     ) -> str:
         doc_scope = ",".join(sorted(document_ids)) if document_ids else "*"
         raw = "|".join(
@@ -82,6 +83,7 @@ class AnswerCacheService:
                 str(self._settings.rag_top_k),
                 str(self._settings.rag_min_score),
                 str(kb_version),
+                f"mem{memory_version}",
             ]
         )
         digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]

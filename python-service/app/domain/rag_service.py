@@ -10,6 +10,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential, wait_fixed
 from app.core.config import get_settings
 from app.domain.answer_cache import CachedAnswer, get_answer_cache_service
 from app.domain.embedding import EmbeddingUsage, get_embedding_service
+from app.domain.memory import get_memory_service
 from app.domain.models_registry import ModelInfo, ModelRegistry
 from app.domain.reranker import get_reranker_service
 from app.domain.vector_store import SearchResult, get_vector_store
@@ -163,6 +164,7 @@ class RAGService:
         session_id: str | None = None,
         document_ids: list[str] | None = None,
         history: list[dict[str, Any]] | None = None,
+        memory_block: str | None = None,
     ) -> RAGResponse:
         """RAG 问答主流程，附带 token 和 skill 调用明细"""
         resolved_session_id = session_id or f"session-{hash(question) % 1000000:06d}"
@@ -189,12 +191,14 @@ class RAGService:
         # 0) 答案缓存：精确命中（Redis），命中则跳过 embedding/检索/生成
         answer_cache = get_answer_cache_service()
         kb_version = await answer_cache.get_kb_version()
+        memory_version = await get_memory_service().get_version()
         cache_key = answer_cache.build_cache_key(
             question=question,
             model_id=model_id,
             embedding_model_id=embedding_model_id,
             document_ids=document_ids,
             kb_version=kb_version,
+            memory_version=memory_version,
         )
         if self._settings.rag_answer_cache_enabled and not has_history:
             cache_start = time.monotonic()
@@ -448,6 +452,7 @@ class RAGService:
                 model_id=model_id,
                 registry=registry,
                 history=trimmed_history,
+                memory_block=memory_block,
             )
             generation_latency_ms = int((time.monotonic() - generation_start) * 1000)
             prompt_tokens += generation.prompt_tokens
@@ -543,6 +548,7 @@ class RAGService:
         registry: ModelRegistry,
         session_id: str | None = None,
         history: list[dict[str, Any]] | None = None,
+        memory_block: str | None = None,
     ) -> RAGResponse:
         """普通聊天（不走 embedding/向量检索）"""
         resolved_session_id = session_id or f"session-{hash(question) % 1000000:06d}"
@@ -558,6 +564,7 @@ class RAGService:
                 model_id=model_id,
                 registry=registry,
                 history=trimmed_history,
+                memory_block=memory_block,
             )
         except Exception as exc:
             raise RAGExecutionError(
@@ -608,6 +615,7 @@ class RAGService:
         registry: ModelRegistry,
         usage_sink: dict[str, int] | None = None,
         history: list[dict[str, Any]] | None = None,
+        memory_block: str | None = None,
     ) -> AsyncIterator[str]:
         """普通聊天流式输出（不走 embedding/向量检索）"""
         model = registry.get_model(model_id)
@@ -622,7 +630,10 @@ class RAGService:
         request_payload = {
             "model": deployment_name,
             "messages": [
-                {"role": "system", "content": CHAT_SYSTEM_PROMPT},
+                {
+                    "role": "system",
+                    "content": self._compose_system_prompt(CHAT_SYSTEM_PROMPT, memory_block or ""),
+                },
                 *trimmed_history,
                 {"role": "user", "content": question},
             ],
@@ -678,6 +689,36 @@ class RAGService:
         wait=wait_fixed(2),
         reraise=True,
     )
+    async def generate_text(
+        self,
+        *,
+        system_prompt: str,
+        user_content: str,
+        model_id: str,
+        registry: ModelRegistry,
+        temperature: float = 0.0,
+        max_tokens: int = 512,
+    ) -> str:
+        """通用单轮文本生成（记忆蒸馏等内部任务复用）"""
+        model = registry.get_model(model_id)
+        client = self._get_chat_client(model)
+        response = await client.chat.completions.create(
+            model=model_id,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content},
+            ],
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        return (response.choices[0].message.content or "").strip()
+
+    @staticmethod
+    def _compose_system_prompt(base_prompt: str, memory_block: str) -> str:
+        if not memory_block:
+            return base_prompt
+        return f"{base_prompt}\n\n{memory_block}"
+
     async def _rewrite_question(
         self,
         question: str,
@@ -720,12 +761,15 @@ class RAGService:
         model_id: str,
         registry: ModelRegistry,
         history: list[dict[str, Any]] | None = None,
+        memory_block: str | None = None,
     ) -> LlmGenerationUsage:
         """调用 LLM 生成回答，并返回 token 使用统计"""
         model = registry.get_model(model_id)
         client = self._get_chat_client(model)
         deployment_name = model_id
-        system_prompt = RAG_SYSTEM_PROMPT.format(context=context)
+        system_prompt = self._compose_system_prompt(
+            RAG_SYSTEM_PROMPT.format(context=context), memory_block or ""
+        )
 
         response = await client.chat.completions.create(
             model=deployment_name,
@@ -768,6 +812,7 @@ class RAGService:
         model_id: str,
         registry: ModelRegistry,
         history: list[dict[str, Any]] | None = None,
+        memory_block: str | None = None,
     ) -> LlmGenerationUsage:
         """普通聊天模式（不带检索上下文）"""
         model = registry.get_model(model_id)
@@ -777,7 +822,10 @@ class RAGService:
         response = await client.chat.completions.create(
             model=deployment_name,
             messages=[
-                {"role": "system", "content": CHAT_SYSTEM_PROMPT},
+                {
+                    "role": "system",
+                    "content": self._compose_system_prompt(CHAT_SYSTEM_PROMPT, memory_block or ""),
+                },
                 *(history or []),
                 {"role": "user", "content": question},
             ],

@@ -241,6 +241,26 @@ class DatabasePool:
             ),
         ]
 
+        # 分层记忆表：global=全局共享；user=用户长期记忆（scope_key 标识用户/命名空间）
+        create_memory_table_sql = """
+        CREATE TABLE IF NOT EXISTS memory_entries (
+            id BIGSERIAL PRIMARY KEY,
+            scope TEXT NOT NULL,
+            scope_key TEXT NOT NULL DEFAULT 'default',
+            content TEXT NOT NULL,
+            source TEXT NOT NULL DEFAULT 'manual',
+            importance INTEGER NOT NULL DEFAULT 3,
+            enabled BOOLEAN NOT NULL DEFAULT TRUE,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """
+        memory_index_statements = [
+            "CREATE INDEX IF NOT EXISTS idx_memory_scope ON memory_entries(scope, scope_key)",
+            "CREATE INDEX IF NOT EXISTS idx_memory_enabled ON memory_entries(enabled)",
+            "CREATE INDEX IF NOT EXISTS idx_memory_updated_at ON memory_entries(updated_at DESC)",
+        ]
+
         async with self._pool.acquire() as conn:
             await conn.execute(create_retrieval_table_sql)
             for sql in alter_statements:
@@ -260,6 +280,10 @@ class DatabasePool:
             # 问答答案缓存表
             await conn.execute(create_answer_cache_sql)
             for sql in answer_cache_index_statements:
+                await conn.execute(sql)
+            # 分层记忆表
+            await conn.execute(create_memory_table_sql)
+            for sql in memory_index_statements:
                 await conn.execute(sql)
 
     async def close(self) -> None:

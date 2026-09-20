@@ -13,6 +13,7 @@ import {
   DocumentListResult,
   DocumentStatusResult,
   McpServerItem,
+  MemoryEntryItem,
   McpSyncResult,
   McpToolItem,
   ModelItem,
@@ -361,6 +362,42 @@ export async function fetchSessionMessages(sessionId: string): Promise<ChatSessi
 export async function deleteChatSession(sessionId: string): Promise<{ deleted: boolean }> {
   const res = await httpDelete<{ deleted: boolean }>(
     `/api/v1/chat/sessions/${encodeURIComponent(sessionId)}`,
+  );
+  return res.data;
+}
+
+// ============== 分层记忆 API ==============
+
+export async function fetchMemoryEntries(scope?: string): Promise<MemoryEntryItem[]> {
+  const query = scope ? `?scope=${encodeURIComponent(scope)}` : "";
+  const res = await httpGet<{ items: MemoryEntryItem[] }>(`/api/v1/memory${query}`);
+  return res.data.items;
+}
+
+export async function createMemoryEntry(payload: {
+  scope: "global" | "user";
+  content: string;
+  scopeKey?: string;
+  importance?: number;
+}): Promise<MemoryEntryItem> {
+  const res = await httpPost<MemoryEntryItem, typeof payload>("/api/v1/memory", payload);
+  return res.data;
+}
+
+export async function updateMemoryEntry(
+  entryId: number,
+  payload: { content?: string; importance?: number; enabled?: boolean },
+): Promise<MemoryEntryItem> {
+  const res = await httpPatch<MemoryEntryItem, typeof payload>(
+    `/api/v1/memory/${encodeURIComponent(entryId)}`,
+    payload,
+  );
+  return res.data;
+}
+
+export async function deleteMemoryEntry(entryId: number): Promise<{ deleted: boolean }> {
+  const res = await httpDelete<{ deleted: boolean }>(
+    `/api/v1/memory/${encodeURIComponent(entryId)}`,
   );
   return res.data;
 }
